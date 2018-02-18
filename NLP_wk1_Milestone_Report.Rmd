@@ -1,0 +1,207 @@
+---
+title: "NLP week 1 - Milestone Report"
+author: "Gabor Simon"
+date: "2018-02-18"
+output: html
+---
+
+## The concept
+
+Our Word Predictor project will employ a statistical model based on the fact that the words can't follow each other
+in any arbitrary order (at least not with expressing some meaning), and **the probability
+of a word at a given position can be estimated with considering the other words preceding it**.
+
+For example, the word 'shuttle' is more likely to occur after the word 'space' or after 'airport', than
+after other words.
+
+This idea would produce kind of a dictionary, that tells us that after a given pre-text which words
+are expected to follow with what probability.
+
+Naturally, this look-behind doesn't have to be restricted to one preceding word, as a longer pre-text
+defines the situation more precisely, but it comes for a price: the dictionary will grow very quickly.
+
+Therefore it is essential that we can decide how big pre-texts are worth considering in each case,
+and don't grow them when they wouldn't gain us significant improvement.
+
+
+## The input corpora
+
+For training our model we use 3 text corpora: one from blog comments, one from newsfeeds and one from tweets.
+
+These text files contain one entry as one line,
+```{r raw_stats}
+library(tibble)
+library(dplyr)
+library(tokenizers)
+
+locale <- "en_US"
+sources <- c("blogs", "news", "twitter")
+
+basename <- function(locale, src) {
+	paste0("final/", locale, "/", locale, ".", src)
+}
+
+print_file_stats <- function(basename, suffix) {
+	total_lines <- 0
+	total_words <- 0
+	total_chars <- 0
+	max_line_len <- 0
+
+	input_filename <- paste0(basename, ".", suffix)
+	input <- file(input_filename, open="r")
+	lines_per_block <- 10000
+	while (T) {
+		lines <- readLines(con=input, n=lines_per_block, encoding="UTF-8", skipNul=T)
+		num_lines = length(lines)
+		if (num_lines <= 0) break
+
+		total_lines <- total_lines + num_lines
+		for (line in lines) {
+			line_len <- nchar(line)
+			total_chars <- total_chars + line_len
+			if (max_line_len < line_len) {
+				max_line_len = line_len
+			}
+			words <- unlist(strsplit(line, split="[[:space:]]+"))
+			total_words <- total_words + length(words)
+		}
+	}
+	message("File stats; file='", input_filename,
+		"', lines='", total_lines,
+		"', words='", total_words,
+		"', chars='" , total_chars,
+		"', max_line_len='", max_line_len, "'")
+}
+
+for (src in sources) {
+	print_file_stats(basename(locale, src), "txt")
+}
+```
+
+## Basic pre-processing
+
+The raw data must be pre-processed even for an exploratory analysis. The steps we do here
+will require further refinement when we have gained some detailed information,
+but for a start they'll do.
+
+When considering the sequences of words, it only makes sense to process words that
+semantically belong together, we can't really predict the start of one sentence from
+the end of the previous one. Similarly, we can't predict a part of a compound sentence
+from the previous part either.
+
+Therefore we must first split each entry to such sub-sequence along the usual
+sentence-ending punctuations, but along joiner words like 'and' and 'or' as well.
+
+Then, to reduce the task we can coalesce all forms of the same word into one stem,
+so 'types', 'typed', 'typing' all becomes simply 'typ'.
+
+
+## Progressive filtering
+
+Even after pre-processing, generating all 3-grams or 4-grams still would be overwhelming, so we
+will need some progressive filtering sooner or later.
+
+
+### By frequency
+
+If a word occurs only 5 times by itself, then it can occur only at most in 10 word-pairs
+(5 places at the beginning, 5 places at the end).
+
+If a word pair occurs only 5 times, then it can occur only at most in 10 word-triplets
+(5 places at the beginning, 5 places at the end).
+
+As a general rule:
+*If an N-gram is insignificantly rare, then so will be all (N+1)-grams that contain it.*
+
+Therefore we count the words (1-grams) first, then discard the rarest ones (say, 5%),
+then we need to collect only those 2-grams that are based on the remaining words, and so on.
+
+
+### By gained information
+
+Suppose we have an 3-gram 'A-B-C', and we collect a statistics on what '-D' words follow
+it with what probability.
+
+Then we collect the similar statistics for only its trailing 2-gram 'B-C'.
+
+If the probabilities after 'A-B-C' are roughly the same as after only 'B-C', then there
+is no point in extending it to 3-gram with 'A-'.
+
+*If the distribution of the followers of an N-gram are close to the followers of its
+trailing (N-1)-gram, then this N-gram brings no new information, and can be discarded.*
+
+As this will require comparing distributions (against some p-value limit, for example)
+by each N-gram, this step will require the most processing capacity.
+
+
+## Current milestone status
+
+At this stage the following pre-processing steps have been completed:
+* splitting the input to sub-sentences
+* reducing the words to their stems
+* collecting the statistics of the words
+
+
+## Exploratory analysis
+
+```{r preprocessing}
+collect_subsentences <- function(input_basename) {
+	input_filename <- paste0(input_basename, ".txt")
+	output_filename <- paste0(input_basename, ".subs")
+	words_filename <- paste0(input_basename, ".words.rds")
+
+	all_words <- tibble::as_tibble()
+	if (!file.exists(output_filename)) {
+
+		input <- file(input_filename, open="r")
+		output <- file(output_filename, open="w")
+		lines_per_block <- 10000
+
+		message("Collecting subsentences; input='", input_filename, "', output='", output_filename, "'")
+		total_lines <- 0
+		while (T) {
+			lines <- readLines(con=input, n=lines_per_block, encoding="UTF-8", skipNul=T)
+			num_lines = length(lines)
+			if (num_lines <= 0) break
+
+			lines <- lines %>%
+			gsub(pattern="[ \t\u2000-\u200d\u2060\u202f\u205f]+", replacement=" ") %>%
+			# here: whitespaces are coalesced into a single space
+			gsub(pattern="[.,!?()\u2010-\u205e]", replacement="\n") %>%
+			# here: sub-sentence delimiters are replaced with line break marks
+			gsub(pattern="^\n+", replacement="") %>% gsub(pattern="\n+$", replacement="") %>% strsplit("\n+") %>% unlist(recursive=F) %>%
+			# here: sub-sentences are split apart
+			tokenize_word_stems(language="english")
+			# here: words are replaced by list of their stems
+
+			# count the words
+			these_words <- lines %>% unlist() %>% tibble::as_tibble() %>% transmute(word=value) %>% group_by(word) %>% summarize(n=n())
+			all_words <- all_words %>% rbind(these_words) %>% group_by(word) %>% summarize(n=sum(n))
+
+			# write the output
+			lines %>% sapply(function(x) {paste0(x,collapse=" ")}) %>% writeLines(con=output)
+
+			total_lines <- total_lines + num_lines
+			message("  Processed block; lines='", total_lines, "'")
+		}
+		close(output)
+		close(input)
+
+		saveRDS(all_words, words_filename)
+	} else {
+		all_words <- readRDS(words_filename)
+	}
+	all_words
+}
+
+keep_most_frequent <- function(table, pct) {
+	threshold <- pct * sum(table$n)
+	table %>% arrange(desc(n)) %>% mutate(total=cumsum(n)) %>% filter(total<threshold) %>% mutate(total=NULL)
+}
+
+words_blogs <- collect_subsentences(basename(locale, "blogs")) %>% keep_most_frequent(pct=0.9)
+words_news <- collect_subsentences(basename(locale, "blogs")) %>% keep_most_frequent(pct=0.9)
+words_twitter <- collect_subsentences(basename(locale, "blogs")) %>% keep_most_frequent(pct=0.9)
+```
+
+
