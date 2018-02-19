@@ -1,5 +1,6 @@
 library(tibble)
 library(dplyr)
+library(stringr)
 library(tokenizers)
 
 locale <- "en_US"
@@ -58,6 +59,37 @@ collect_subsentences <- function(input_basename) {
 	all_words
 }
 
-sample_words <- collect_subsentences("sample")
+print_file_stats <- function(basename, suffix) {
+	input_filename <- paste0(basename, ".", suffix)
+	input <- file(input_filename, open="r")
+	lines_per_block <- 10000
+	total_stats <- tibble::as_tibble()
+	total_lines <- 0
+	while (T) {
+		lines <- readLines(con=input, n=lines_per_block, encoding="UTF-8", skipNul=T)
+		num_lines = length(lines)
+		if (num_lines <= 0) break
+
+		this_stat <- lines %>% trimws() %>% tibble::as_tibble() %>%
+			transmute(line_len=nchar(value), num_words=str_count(value, "\\S+")) %>%
+			group_by() %>% summarize(num_chars=sum(line_len), num_words=sum(num_words), num_lines=n(), max_line_len=max(line_len))
+
+		total_stats <- total_stats %>% rbind(this_stat) %>% summarize_all(sum)
+		total_lines <- total_lines + num_lines
+		message("  Processed block; lines='", total_lines, "'")
+	}
+	close(input)
+	message("File stats; file='", input_filename,
+		"', lines='", total_stats$num_lines,
+		"', words='", total_stats$num_words,
+		"', chars='" , total_stats$num_chars,
+		"', max_line_len='", total_stats$max_line_len, "'")
+}
+
+#print("Reference; file='sample.txt', lines='1000', words='41890', chars='230757', max_line_len='1912'")
+#print_file_stats("sample", "txt")
+
+print_file_stats("final/en_US/en_US.blogs", "txt")
+#sample_words <- collect_subsentences("sample")
 
 

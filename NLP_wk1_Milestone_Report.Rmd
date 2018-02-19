@@ -5,35 +5,57 @@ date: "2018-02-18"
 output: html
 ---
 
+<!-- multi-column layout: https://stackoverflow.com/questions/31753897/2-column-section-in-r-markdown -->
+<style>
+.column-left{
+  float: left;
+  width: 33%;
+  text-align: left;
+}
+.column-center{
+  display: inline-block;
+  width: 33%;
+  text-align: center;
+}
+.column-right{
+  float: right;
+  width: 33%;
+  text-align: right;
+}
+</style>
+
 ## The concept
 
-Our Word Predictor project will employ a statistical model based on the fact that the words can't follow each other
+Our Word Predictor project will employ a statistical model based on the fact that the words don't follow each other
 in any arbitrary order (at least not with expressing some meaning), and **the probability
-of a word at a given position can be estimated with considering the other words preceding it**.
-
+of a word at a given position can be estimated by considering the other words preceding it**.
 For example, the word 'shuttle' is more likely to occur after the word 'space' or after 'airport', than
 after other words.
 
-This idea would produce kind of a dictionary, that tells us that after a given pre-text which words
+This idea would produce kind of a dictionary that tells us that after a given pre-text which words
 are expected to follow with what probability.
 
-Naturally, this look-behind doesn't have to be restricted to one preceding word, as a longer pre-text
-defines the situation more precisely, but it comes for a price: the dictionary will grow very quickly.
+Naturally, this look-behind doesn't have to be restricted to one preceding word, longer pre-texts
+describe the situation more precisely, but it comes for a price: the dictionary will grow very quickly.
 
 Therefore it is essential that we can decide how big pre-texts are worth considering in each case,
-and don't grow them when they wouldn't gain us significant improvement.
+and don't grow them when we wouldn't gain significant improvement by it.
 
+The source of this document, including the R codes are available on [GitHub](https://github.com/gsimon75/NLP_capstone).
 
 ## The input corpora
 
 For training our model we use 3 text corpora: one from blog comments, one from newsfeeds and one from tweets.
 
-These text files contain one entry as one line,
-```{r raw_stats}
+```{r libs, results='hide', echo=F, message=F, warning=F}
 library(tibble)
 library(dplyr)
+library(stringr)
 library(tokenizers)
+library(lattice)
+```
 
+```{r raw_stats, echo=F}
 locale <- "en_US"
 sources <- c("blogs", "news", "twitter")
 
@@ -42,40 +64,32 @@ basename <- function(locale, src) {
 }
 
 print_file_stats <- function(basename, suffix) {
-	total_lines <- 0
-	total_words <- 0
-	total_chars <- 0
-	max_line_len <- 0
-
 	input_filename <- paste0(basename, ".", suffix)
 	input <- file(input_filename, open="r")
 	lines_per_block <- 10000
+	total_stats <- tibble::as_tibble()
 	while (T) {
 		lines <- readLines(con=input, n=lines_per_block, encoding="UTF-8", skipNul=T)
 		num_lines = length(lines)
 		if (num_lines <= 0) break
 
-		total_lines <- total_lines + num_lines
-		for (line in lines) {
-			line_len <- nchar(line)
-			total_chars <- total_chars + line_len
-			if (max_line_len < line_len) {
-				max_line_len = line_len
-			}
-			words <- unlist(strsplit(line, split="[[:space:]]+"))
-			total_words <- total_words + length(words)
-		}
+		this_stat <- lines %>% trimws() %>% tibble::as_tibble() %>%
+			transmute(line_len=nchar(value), num_words=str_count(value, "\\S+")) %>%
+			group_by() %>% summarize(num_chars=sum(line_len), num_words=sum(num_words), num_lines=n(), max_line_len=max(line_len))
+
+		total_stats <- total_stats %>% rbind(this_stat) %>% summarize_all(sum)
 	}
+	close(input)
 	message("File stats; file='", input_filename,
-		"', lines='", total_lines,
-		"', words='", total_words,
-		"', chars='" , total_chars,
-		"', max_line_len='", max_line_len, "'")
+		"', lines='", total_stats$num_lines,
+		"', words='", total_stats$num_words,
+		"', chars='" , total_stats$num_chars,
+		"', max_line_len='", total_stats$max_line_len, "'")
 }
 
-for (src in sources) {
-	print_file_stats(basename(locale, src), "txt")
-}
+#for (src in sources) {
+#	print_file_stats(basename(locale, src), "txt")
+#}
 ```
 
 ## Basic pre-processing
@@ -86,14 +100,13 @@ but for a start they'll do.
 
 When considering the sequences of words, it only makes sense to process words that
 semantically belong together, we can't really predict the start of one sentence from
-the end of the previous one. Similarly, we can't predict a part of a compound sentence
-from the previous part either.
+the end of the previous one.
 
-Therefore we must first split each entry to such sub-sequence along the usual
-sentence-ending punctuations, but along joiner words like 'and' and 'or' as well.
+Similarly, we can't predict a part of a compound sentence from the previous part either,
+so we must first split each entry to such sub-sequence along the usual punctuations.
 
 Then, to reduce the task we can coalesce all forms of the same word into one stem,
-so 'types', 'typed', 'typing' all becomes simply 'typ'.
+so for example all of 'types', 'typed', 'typing' becomes simply 'typ'.
 
 
 ## Progressive filtering
@@ -113,8 +126,9 @@ If a word pair occurs only 5 times, then it can occur only at most in 10 word-tr
 As a general rule:
 *If an N-gram is insignificantly rare, then so will be all (N+1)-grams that contain it.*
 
-Therefore we count the words (1-grams) first, then discard the rarest ones (say, 5%),
-then we need to collect only those 2-grams that are based on the remaining words, and so on.
+Therefore we count the words (1-grams) first, then discard the rarest ones (say, up to 5% of
+all occurences), then we need to collect only those 2-grams that are based on the remaining
+words, and so on.
 
 
 ### By gained information
@@ -137,6 +151,7 @@ by each N-gram, this step will require the most processing capacity.
 ## Current milestone status
 
 At this stage the following pre-processing steps have been completed:
+ 
 * splitting the input to sub-sentences
 * reducing the words to their stems
 * collecting the statistics of the words
@@ -144,7 +159,7 @@ At this stage the following pre-processing steps have been completed:
 
 ## Exploratory analysis
 
-```{r preprocessing}
+```{r preprocessing, echo=F}
 collect_subsentences <- function(input_basename) {
 	input_filename <- paste0(input_basename, ".txt")
 	output_filename <- paste0(input_basename, ".subs")
@@ -191,17 +206,76 @@ collect_subsentences <- function(input_basename) {
 	} else {
 		all_words <- readRDS(words_filename)
 	}
-	all_words
+	total <- sum(all_words$n)
+	all_words %>% arrange(desc(n)) %>% mutate(coverage=cumsum(n)/total)
 }
 
-keep_most_frequent <- function(table, pct) {
-	threshold <- pct * sum(table$n)
-	table %>% arrange(desc(n)) %>% mutate(total=cumsum(n)) %>% filter(total<threshold) %>% mutate(total=NULL)
-}
+words_blogs <- collect_subsentences(basename(locale, "blogs")) %>% mutate(src="blogs")
+words_news <- collect_subsentences(basename(locale, "news")) %>% mutate(src="news")
+words_twitter <- collect_subsentences(basename(locale, "twitter")) %>% mutate(src="twitter")
 
-words_blogs <- collect_subsentences(basename(locale, "blogs")) %>% keep_most_frequent(pct=0.9)
-words_news <- collect_subsentences(basename(locale, "blogs")) %>% keep_most_frequent(pct=0.9)
-words_twitter <- collect_subsentences(basename(locale, "blogs")) %>% keep_most_frequent(pct=0.9)
+plot_by_frequency <- function(pct, fm) {
+	frequent_blogs <- words_blogs %>% filter(coverage <= pct)
+	frequent_blogs$idx <- seq.int(nrow(frequent_blogs))
+	frequent_news <- words_news %>% filter(coverage <= pct)
+	frequent_news$idx <- seq.int(nrow(frequent_news))
+	frequent_twitter <- words_twitter %>% filter(coverage <= pct)
+	frequent_twitter$idx <- seq.int(nrow(frequent_twitter))
+
+	all_words <- rbind(frequent_blogs, frequent_news, frequent_twitter)
+	xyplot(as.formula(fm), data=all_words, type="l", layout=c(3, 1))
+}
 ```
 
+The distribution of the most frequent 90% of words in the corpora shows that
+these top words are unproportionally frequent.
+
+```{r plot_occurences, echo=F}
+plot_by_frequency(pct=0.9, n ~ idx | src)
+```
+
+The coverage plot seems to confirm the hypothesis that
+
+* the top 300 words cover a basic level of knowledge (~50%)
+* the top 1000 words cover an advanced level (~80%)
+* about 10000 words are required for a native level (>95%)
+
+```{r plot_coverage, echo=F}
+plot_by_frequency(pct=0.9, coverage ~ idx | src)
+```
+
+The most frequent words seem to correlate between the sources:
+
+<div class="column-left">
+Blogs
+```{r coverage_blogs, echo=F}
+words_blogs %>% mutate(src=NULL) %>% print(n=15)
+```
+</div>
+
+<div class="column-center">
+News
+```{r coverage_news, echo=F}
+words_news %>% mutate(src=NULL) %>% print(n=15)
+```
+</div>
+
+<div class="column-right">
+Twitter
+```{r coverage_twitter, echo=F}
+words_twitter %>% mutate(src=NULL) %>% print(n=15)
+```
+</div>
+
+Fortunately the information-gain-based filtering will eliminate most of the rare words
+(including the proper nouns, for example), so our final dictionary won't be
+impractically large.
+
+## Next steps
+
+Next we will implement the n-gram generation using `tokenizer::tokenize_ngrams(...)`,
+and the measurement of the information gain.
+
+As it involves manipulating large quantities of data, the data representation
+may require changes as well.
 
