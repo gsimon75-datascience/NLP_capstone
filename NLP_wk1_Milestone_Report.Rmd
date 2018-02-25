@@ -87,9 +87,9 @@ print_file_stats <- function(basename, suffix) {
 		"', max_line_len='", total_stats$max_line_len, "'")
 }
 
-#for (src in sources) {
-#	print_file_stats(basename(locale, src), "txt")
-#}
+for (src in sources) {
+	print_file_stats(basename(locale, src), "txt")
+}
 ```
 
 ## Basic pre-processing
