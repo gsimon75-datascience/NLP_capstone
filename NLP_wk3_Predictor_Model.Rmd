@@ -1,8 +1,11 @@
 ---
 title: "NLP week 3 - Predictor Model"
 author: "Gabor Simon"
-date: "2018-02-21"
-output: html
+date: "2018-02-25"
+output:
+  html_document:
+    toc: true
+    theme: united
 ---
 
 <!-- multi-column layout: https://stackoverflow.com/questions/31753897/2-column-section-in-r-markdown -->
@@ -24,321 +27,209 @@ output: html
 }
 </style>
 
-## Improvements of the concept
 
-As we want to predict whole words, not only word stems, it turned out that word stemming is not
-that good idea after all.
+## Improvements since last Milestone
 
-The role of quotation marks is also revised, because it is not used for actually quoting a different
-passage of text (which would discontinue the current sentence), but as emphasizing expressions
-(which still belong to the current sentence).
+(The source of this document, including the all codes are available on [GitHub](https://github.com/gsimon75/NLP_capstone).)
 
-Additionally, the handling of various Unicode punctuation marks has been improved, and the
-definition of 'valid' words got tighter, they:
+### Regarding concept
+
+1. As we want to predict whole words, not only word stems, it turned out that word stemming is not
+   that good idea after all.
+
+2. The role of quotation marks is also revised, because it is not used for actually quoting a different
+   passage of text (which would discontinue the current sentence), but as emphasizing expressions
+   (which still belong to the current sentence).
+
+3. The handling of various Unicode punctuation marks has been improved, and the definition of 'valid' words got tighter, they:
 
 * must contain at least one lowercase letter (sorry, can't decide what to do with ALL CAPS WORDS)
 * may contain only alphanumeric, apostrophe, underscore, plus, dash
 * must be at least two characters long, except for 'I' and 'a'
 * must begin and end with alphanumeric
-* standalone "o'" is replaced with "of"
+* standalone "o'" is replaced with "of", "ol'" with "old"
 
-The start-of-sentence position has its own distribution of words, which is different from the
-global word distribution, so similarly to the regex concept, we introduce the special word "^" for it.
+4. The start-of-sentence and the start-of-sub-sentence positions have their own distributions of words,
+   which is different from the global word distribution, so we introduced the special words
+   `^` and `,` for them.
 
-The result of the predictor is only the list of the suggested words, in order of preference,
-so strange as it may seem, **it is only the order that matters, the probabilities are irrelevant**.
+5. As we discard the rarest words (for performances sake), we replace them with the `_` symbol, so
+   sequences like "The dandelion is..." become  "The _ is ..." and not just "The is ..."
 
-### Sub-sentence splitting revised
+6. The result of the predictor is only the list of the suggested words, in order of preference,
+   so strange as it may seem, **it is only the order that matters, the probabilities are irrelevant**.
 
-```{r subsentences}
-library(tibble)
-library(dplyr)
-library(stringr)
+### Regarding implementation
 
-locale <- "en_US"
-sources <- c("blogs", "news", "twitter")
+1. The N-gram data easily exceeds beyond memory capacity (> 1 GB at n >= 4), but counting the
+   n-grams can't be serially processed, so we must use some storage backend.
+   But storage is slow, so we need some combination of memory and storage (like cached storage or
+   swapped memory), and instead of reinventing the wheel we used a database backend (**SQLite**).
 
-basename <- function(locale, src) {
-	paste0("final/", locale, "/", locale, ".", src)
-}
+2. The task contains much more data processing than mathematical statistics, and here the
+   performance of R is inadequate, so I switched to **python** (`rmarkdown` supports it via the
+   `reticulate` R package).
+   The speed gain is around 60-80 times at text mangling, that is the difference between a
+   runtime of half a day and a whole month...
 
-collect_subsentences <- function(basename) {
-	input_filename <- paste0(basename, ".txt")
-	output_filename <- paste0(basename, ".subs")
-	words_filename <- paste0(basename, ".words.rds")
+Profiling details are out of scope here, but the main factors in a nutshell:
 
-	all_words <- tibble::as_tibble()
-	if (!file.exists(output_filename)) {
-		input <- file(input_filename, open="r")
-		output <- file(output_filename, open="w")
-		lines_per_block <- 10000
+* R text and list processing itself is about 10 times slower than python
+* the `RSQLite` package supports only one simultaneous prepared statement, so for two it means parsing SQL over and over again...
+* the `mongolite` package communicates via JSON (in contrast to BSON), so text formatting and parsing impacts here as well
+* SQLite is local (in-process), mongo is server-client, so the latter involves some communication that has a cost,
+  and we don't really need the benefits of mongo (scalability, aggregate pipes, map-reduce, etc.)
+* R pipelines like `f %>% g %>% h` are syntactic sugar for `h(g(f()))` and frees the temporaries only at the end
+* native R vector ops like `%in%` are quite fast, but custom functions aren't, and `Vectorize` is just wrapping `lapply()`
+* the real strengths of R are math-related, of which we require shamefully little at this project
 
-		message("Collecting subsentences; input='", input_filename, "', output='", output_filename, "'")
-		total_lines <- 0
-		while (T) {
-			lines <- readLines(con=input, n=lines_per_block, encoding="UTF-8", skipNul=T)
-			num_lines = length(lines)
-			if (num_lines <= 0) break
-
-			lines <- lines %>%
-			gsub(pattern="[\u2018-\u201b\u2032\u2035`]", replacement="'") %>%
-			gsub(pattern="[\u201c-\u201f\u2033\u2034\u2036\u2037\u2039\u203a\u2057]", replacement="\"") %>%
-			gsub(pattern="[\u2010-\u2015\u2043]", replacement="-") %>%
-			gsub(pattern="[\u2024\u2027]", replacement=".") %>%
-			gsub(pattern="\u2025", replacement="..") %>%
-			gsub(pattern="\u2026", replacement="...") %>%
-			gsub(pattern="[\u2000-\u200d\u2060\u202f\u205f]+", replacement=" ") %>%
-			gsub(pattern="\u2063", replacement=",") %>%
-			gsub(pattern="\u2052", replacement="%") %>%
-			gsub(pattern="[\u204e\u2055\u2062]", replacement="*") %>%
-			gsub(pattern="\u2052", replacement="%") %>%
-			gsub(pattern="\u2064", replacement="+") %>%
-			# unicode punctuation reverted to plain ascii
-			gsub(pattern="^|\\s+", replacement=" ") %>%
-			gsub(pattern="$", replacement=" ") %>%
-			# now ^ and $ are handled by whitespace rules, and word separator is also space
-			gsub(pattern=" i ", replacement=" I ") %>%
-			gsub(pattern=" o' ", replacement=" of ", ignore.case="T") %>%
-			gsub(pattern=" ol' ", replacement=" old ", ignore.case="T") %>%
-			# standalone "o'" replaced with "of"
-			gsub(pattern=" '|' |[()\"]", replacement=" ") %>%
-			# NOTE: if quotes are sub-sentence delimiters, then replacement=" \n "
-			gsub(pattern="[.,!?]", replacement=" \n ") %>%
-			strsplit("\n+") %>% unlist(recursive=F) %>%
-			# split apart at sub-sentence delimiters
-			gsub(pattern=" [^a-z]+ ", replacement=" ") %>%
-			# zapped all words without at least one lowercase letter
-			# NOTE: no way to handle ALL CAPS WORDS correctly: proper nouns should be like 'John',
-			# the rest should be lowercase, and we don't want to suggest all caps later, so we
-			# can't keep it that way either
-			gsub(pattern=" [^ ]*[^ [:alnum:]'_+-][^ ]* ", replacement=" ") %>%
-			# zapped all words with invalid characters (valid: alnum, ', _, +, -)
-			gsub(pattern=" [^IiAa] ", replacement=" ") %>%
-			# zapped all single characters except 'I' and 'a'
-			gsub(pattern=" [^[:alnum:]]+", replacement=" ") %>%
-			# zapped non-alnums in front of words
-			gsub(pattern="[^[:alnum:]]+ ", replacement=" ") %>%
-			# zapped non-alnums at the end of words
-			str_trim() %>% Filter(f=function(x) { x != ""} )
-			# empty lines removed
-
-			# count the words
-			these_words <- lines %>% strsplit(" ") %>% unlist() %>% tibble::as_tibble() %>% transmute(word=value) %>% group_by(word) %>% summarize(n=n())
-			all_words <- all_words %>% rbind(these_words) %>% group_by(word) %>% summarize(n=sum(n))
-
-			# write the output
-			lines %>% sapply(function(x) {paste0(x,collapse=" ")}) %>% writeLines(con=output)
-
-			total_lines <- total_lines + num_lines
-			message("  Processed block; lines='", total_lines, "'")
-		}
-		close(output)
-		close(input)
-
-		total <- sum(all_words$n)
-		all_words %>% arrange(desc(n)) %>% mutate(coverage=cumsum(n)/total)
-
-		saveRDS(all_words, words_filename)
-	} else {
-		all_words <- readRDS(words_filename)
-	}
-	return(all_words)
-}
-
-#words_blogs <- collect_subsentences(basename(locale, "blogs")) %>% mutate(src="blogs")
-#words_news <- collect_subsentences(basename(locale, "news")) %>% mutate(src="news")
-#words_twitter <- collect_subsentences(basename(locale, "twitter")) %>% mutate(src="twitter")
-```
 
 ## The prediction algorithm
 
-If we had only the global list of words ordered by decreasing number of occurences, we would always
+If we had only a global list of words ordered by decreasing number of occurences, we could always
 suggest the frontmost N of it.
 
-By the way, that is what we will revert to if we don't have any special knowledge about a given prefix,
-so we must store our decisions only about those prefixes that differ from it.
+In fact, that is exactly what we will fall back to if we can't predict any better, so we must store
+our suggestions only about those contexts that would predict something different than this global one.
 
-Our dictionary will contain (prefix, wordlist) entries, where the prefix means the words we
+We will have a dictionary of (prefix, wordlist) entries, where the prefix means the words we
 already read since the beginning of the sentence, and the wordlist contains the words we shall
-predict (in the order we shall predict them).
+suggest to the user (in that order).
 
-So, the prediction algorithm will go as follows:
+So, the prediction algorithm goes as follows:
 
-1. At the start of a sentence we presume that we have already read the special word "^"
+1. First we normalise the prediction context as described (discard invalid characters, add
+   leading `^` word, replace rare words with `_`, etc.)
 
-2. In the middle of a sentence, eg. after the words A - B - C we look up our dictionary for
-   the longest possible prefix (that is A - B - C), if not found, then we look up the shorter
-   ones (B - C, then C).
+2. When in the middle of a sentence, eg. after the words ^-A-B-C we look up our dictionary for
+   the longest possible prefix (that is, ^-A-B-C), if not found, then we look up the shorter
+   ones (A-B-C, if not found, then B-C, if not found, then C).
 
-3. If we found nothing, then this prefix is a usual one, so we use our global word list and
-   suggest its frontmost N words.
+3. If we found nothing, then this prefix don't predict anything unusual, so we use our global
+   word list and suggest its frontmost N~sug~ words.
 
 4. If we found a prefix in the dictionary, it means that it differs from the global context,
-   and we take its wordlist, and suggest its foremost N words.
+   and we offer its wordlist as suggestion.
 
 That also means that if we know the maximal number of requested suggestions, we must store
-only those top-Nmax suggestions in the wordlists of the dictionary. **This N~sug~ maximal number of
-suggestions is a parameter of our model.**
+only those top-N suggestions in the wordlists of the dictionary.
 
-(Practically it doesn't make much sense providing more than eg. 10 suggestions, because it
+**This N~sug~ maximal number of suggestions is a parameter of our model.**
+
+(Practically it doesn't make much sense providing more than eg. 5 suggestions, because it
 takes about the same user effort to actually type in a word as choosing it from a list longer
 than this.)
 
 
+
 ## The dictionary builder algorithm
 
-First of all we need a global list of words, ordered by descending number of occurences.
-For cutting away the irrelevant words as soon as possible, we discard the least frequent 10%.
-This will be the default distribution for those cases that aren't in our dictionary.
+0. Split the input to training and test parts, the current ratio is 80% vs. 20%
 
-**This p~discard~ rare word removal limit is a parameter of our model**
+1. Normalise the input lines and split them to sentences.
 
+2. Collect the global list of words, ordered by descending number of occurences.
+   For cutting away the irrelevant words as soon as possible, we discard the least frequent 10%.
+   The remaining ones will be the default suggestion for those cases that aren't in our dictionary.
 
-### 2-grams step
+   **This p~discard~ rare word removal limit is a parameter of our model**
 
-Then we generate all 2-grams 'A-B', discard all that ends with some 'rare' word (we won't try to predict those),
-and group them by their 1-word prefix 'A'.
+3. Filter the sentences for 'rare' words, replace them with `_`
 
-Then we iterate these groups, and see if the distribution of their followers differ significantly
-from the global word order.
+4. Split the sentences into words, form N-grams from them, and count their
+   occurences through all sentences.
 
-If it does, then we record this 1-word prefix and the suggestion order of its followers.
+5. Update the dictionary by the N-gram distribution (see below)
 
-### 3-grams step
-
-Then we generate all 3-grams 'A-B-C', discard all that ends with some 'rare' word,
-and group them by their 2-word prefix 'A-B'.
-
-Then we iterate these groups, and see if the distribution of their followers differs significantly 
-from the distribution of 'B'-d followers (if 'B' is in our dictionary) or otherwise from the global order.
-
-If it does, then we record this 2-word prefix and the suggestion order of its followers.
-
-### 4-grams step
-
-Then we generate all 4-grams 'A-B-C-D', discard all that ends with some 'rare' word,
-and group them by their 3-word prefix 'A-B-C'.
-
-Then we iterate these groups, and see if the distribution of their followers differ significantly
-from the distribution of 'B-C'-s followers (if 'B-C' is in our dictionary), or otherwise from 'C'-s
-followers (if 'C' is in our dictionary), or otherwise from the global order.
-
-If it does, then we record this 3-word prefix and the suggestion order of its followers.
-
-### Definition of 'two word-distributions differ significantly'
-
-As we stated at Concepts, the actual probabilities are irrelevant, only the order matters,
-therefore we can define it as:
-
-*The difference of two word-distributions is the Damerau-Levenshtein distance of the sequences of
-their N~sug~ first words.*
-
-It is important that we are comparing not words (by adding/removing/swapping/replacing letters),
-but word sequences (by adding/removing/swapping/replacing words).
-
-Now that we have *difference*, we only need to define the *significant*:
-
-*If two word-distributions are nearer than a given limit, we treat them as equals. This
-D~min~ distance is a parameter of our model.*
+6. Increment N and repeat until we got enough information
 
 
-### Definition of 'we record a (prefix+suggestion) to the dictionary'
+### Processing an N-gram distribution
 
-When we found that a prefix has different suggestions than its parents, it makes sense to
-store it in the dictionary, but then the dictionary might grow too large, so we must have a
-selection here.
+The question here is whether we need to store a given N-gram plus its possible follower words or not.
 
-If we assign a 'value' to each dictionary entry, proportional to how much is it worth to us,
-then we could keep the dictionary limited in size, but still containing the most valuable entries.
+Storing uses resources, so the idea is to do it only if it gives us information.
 
-One such 'value' measure could be the number of occurences in which that entry's prediction
-differs from its parents', which will be a possible refinement later, but now we define
+If the suggestion algorithm can't find a given prefix, it'll revert to its parent (one shorter),
+so **we need to store a given N-gram prefix only if its follower distribution differs from its parent**.
 
-*The value of a dictionary entry is its distance from its parent times the total
-occurences of its prefix*
+How much improvement would then a prefix give us over its parent?
+
+Suppose the 'A-B-C' prefix occurs N~A,B,C~ times and would suggest the words 'P, Q, R', and its parent, the
+'B-C' prefix would suggest the words 'P, S, R'.
+
+Then the improvement of storing this 'A-B-C-{P, Q, R}' would bring is the distance between the two
+suggestion sequences 'P, Q, R' and 'P, S, R', times its occurence N~A,B,C~.
+
+For telling the distance between suggestion word sequences we use a
+[Damerau-Levenshtein distance](https://en.wikipedia.org/wiki/Damerau%E2%80%93Levenshtein_distance#Definition)
+metric, only applying it to words instead of letters.
 
 
-And then we only have to specify the *N~dict~ maximal number of entries of our dictionary,
-which is also a parameter of our model*.
+### Maintaining the dictionary
 
+If we just store all such prefix+suggestion entries, the dictionary would grow to impractical sizes, so
+we defined a constraint:
+
+We store only the most valuable (prefix, suggestions) combinations,
+and this **N~dict~ maximal number of entries of our dictionary is also a parameter of our model**.
+
+For the definition of 'value' we use the already mentioned measure of improvement: the suggestion distance
+from the parent times the number of occurences.
+
+So, adding a new entry to the dictionary goes like:
+
+1. If the dict is not full, then we add the (prefix, suggestions, value) triplet.
+2. If the dict is full, we look up the least valuable entry in it, and
+3. If the new entry is less valuable than the (already stored) least valuable one, then we just discard the new one
+4. Otherwise add the new one, but discard the least valuable one
+5. When not adding a new entry, or discarding an already stored one, we effectively 
+   unify it with its parent, so we must add its 'value' to its parents 'value' field
 
 ## Data representation
 
-The n-grams that end with a rare word can be filtered out while generating the n-grams, that is a
-cheap operation. 
+As discussed, we use SQLite databases, and the plural is intentional here.
 
-On the other hand, grouping and counting of all n-grams for a given 'n' requires random access
-to the list being built, but that can be bigger than the available memory, so that list must be
-backed by storage. But storage is slow, so some combination of memory and storage (like cached
-storage or swapped memory) is required, so to avoid reinventing the wheel, the `rsqlite` package
-is used for this purpose.
+On one hand, the dictionary will contain our model, it is our deliverable item, so we must be able to ship it.  
+On the other hand, the N-gram collection is needed only during the training phase, so it must be separate
+from the dictionary.  
+On the gripping hand :), the raw input data is plain text file, so we will have at
+least these three types of storage.
 
-### N-grams: Naive representation
+### Plaintext files
 
-While processing the n-grams, we want to record (prefix, follower, occurences) triplets,
-so our table `ngram_t` will have these 3 columns.
+* `final/<locale>/<locale>.<source>.txt`: original input data
+* `final/<locale>/<locale>.<source>.train.txt`: approx. 80% of the input for training the model
+* `final/<locale>/<locale>.<source>.test.txt`: the rest of the input for testing the model, eg.:
 
-* prefix(string): this is our (n-1)-gram prefix, separated by spaces
-* follower(string): this is the follower word
-* occurences(integer): the number of occurences of this n-gram
+  ```In the years thereafter, most of the Oil fields and platforms were named after pagan “gods”. ```
 
-It will have about nwords^n rows, each containing n words, so the raw storage requirement
-will be around n * nwords^n, but accessing a record requires only one lookup, so it is fast.
+* `final/<locale>/<locale>.<source>.all.sentences`: the training data normalised and split to sentences, eg.:
 
-### N-grams: Tree representation
+  ```In the years thereafter , most of the Oil fields and platforms were named after pagan gods```
 
-If we store the n-grams as a tree, where each node has an ID, like for example for the
-following 3-grams:
+* `final/<locale>/<locale>.<source>.common.sentences`: the sentences, with the rare words replaced with `_`, `^` added, eg.:
 
-``` 
-A-B-C
-A-B-D
-E-B-C
-E-B-D
+  ```^ In the years _ , most of the Oil fields and _ were named after _ gods```
 
-Node = (id, word, nextid), ID=0 is the root '^'
+### Database files
+* `final/<locale>/<locale>.<source>.<N>.db`: the N-gram statistics, (prefix, follower, count)
+* `dict.db`: the dictionary, (prefix, suggestions, value)
 
-(0, A, 1)
-  (1, B, 2)
-    (2, C, -1) -> 'A-B-C'
-    (2, D, -1) -> 'A-B-D'
-(0, E, 3)
-  (3, B, 4)
-    (4, C, -1) -> 'E-B-C'
-    (4, D, -1) -> 'E-B-D'
-```
+This latter `dict.db` also contains the word statistics of the trained corpora:
+the word, the term frequency, the number of occurences and the coverage.
 
-This way each entry requires 1 word and 2 integers, and the number of rows is
-nwords^n + nwords^(n-1) + ... + nwords = (nwords^(n+1) - 1) / (nwords - 1) - 1
+(Coverage means the cumulative sum of term frequencies up to that word in the
+list ordered by descending number of occurences.)
 
-It is almost n times less than the naive storage, but accessing a record
-requires n lookups instead of one, so it is n times slower.
+## Implementation - training the model
 
-If we are getting out of storage, we may need this, but first let's try the
-simpler approach.
-
-(Occurence number and nextid are mutually exclusive, so they may share the
-last integer, eg. one can be positive, the other can be negative.)
 
 ```{python test_python_code}
 for i in range(1, 10):
 	print i
 ```
 
-### The dictionary
-
-The dictionary is much simpler: for a word sequence of prefixes it assigns
-a word sequence of suggestions, and it has a value of its 'worth', 
-but its size is limited by the nature of the application: it must fit to a mobile device.
-
-Therefore it is by far not as critical as the n-grams, the naive approach
-shall suffice: Our table `dict_t` will have three columns:
-
-* prefix(string): the prefix words separated by space
-* suggestion(string): the suggested words separated by space
-* value(integer): its worth
-
-The source of this document, including the R codes are available on [GitHub](https://github.com/gsimon75/NLP_capstone).
 
 
 ## Current milestone status

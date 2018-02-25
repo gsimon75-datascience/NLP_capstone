@@ -7,11 +7,13 @@ sys.setdefaultencoding('UTF8')
 import re
 import os.path
 from time import time
+import random
 import codecs
 import sqlite3
-import cPickle
 
-## Parameters
+##############################################################################
+# Parameters
+#
 
 # Number of suggestions
 N_sug = 5
@@ -21,10 +23,11 @@ p_discard = 0.1
 p_keep = 1 - p_discard
 
 # Maximal size of the suggestion dictionary
-N_max = 100000
+N_max = 200000
 
-locale = "en_US"
-sources = ["blogs", "news", "twitter"]
+##############################################################################
+# Parts of the training process
+#
 
 # Print progress messages only once in a second
 last_progress_printout = time()
@@ -36,18 +39,13 @@ def need_progress_printout():
         return True
     return False
 
-# Formulate a corpus base path from locale and source type
-def basename(locale, src):
-    return "final/{l}/{l}.{s}".format(l=locale, s=src)
-
-
 # Normalisation regexes for whole sentences - may produce line breaks
-sentence_rules = [
+line_rules = [
     # pre-compiled regex                                                        replacement
     #
     # revert unicode punctuation to ascii
     [re.compile(u"[\u2018-\u201b\u2032\u2035`]"),                               "'"],
-    [re.compile(u"[\u201c-\u201f\u2033\u2034\u2036\u2037\u2039\u203a\u2057\xab\xbb]"),  "\""],
+    [re.compile(u"[\u201c-\u201f\u2033\u2034\u2036\u2037\u2039\u203a\u2057\xab\xbb]"), "\""],
     [re.compile(u"[\u2010-\u2015\u2043]"),                                      "-"],
     [re.compile(u"[\u2024\u2027]"),                                             "."],
     [re.compile(u"\u2025"),                                                     ".."],
@@ -58,160 +56,209 @@ sentence_rules = [
     [re.compile(u"[\u204e\u2055\u2062]"),                                       "*"],
     [re.compile(u"\u2052"),                                                     "%"],
     [re.compile(u"\u2064"),                                                     "+"],
-    # sub-sentence separators to newline with trailing-leading spaces
-    [re.compile("[.,!?]"),                                                      " \n "]
+    # sub-sentence separators to comma or newline with trailing-leading spaces
+    [re.compile("\\r"),                                                         ""],
+    [re.compile("^|$"),                                                         " "],
+    [re.compile("(,\\s*)+"),                                                    " , "],
+    # coalesce adjacent subsentence delimiters
+    [re.compile("(,\\s*)+"),                                                    " , "],
+    # strip leading and trailing subsentence delimiters
+    [re.compile("(,\\s*)+$"),                                                   ""],
+    [re.compile("^(\\s*,)+"),                                                   ""],
+    # finally: split at sentence delimiters
+    [re.compile("[.!?]+"),                                                       " \n "]
 ]
 
 # Normalisation regexes for sub-sentences
-subsentence_rules = [
+sentence_rules = [
     # pre-compiled regex                                                        replacement
-    # handle ^ and $ by whitespace rules, and word separator is also space
     # (NOTE: must be here at front, others rely on its result)
-    [re.compile("^|$"),                                                         " "],
     # some common typos and abbreviations (NOTE: standalone only)
     [re.compile(" i "),                                                         " I "],
     [re.compile(" o' ", re.I),                                                  " of "],
     [re.compile(" ol' ", re.I),                                                 " old "],
-    # not-in-word apostrophes, quotes, parentheses to space
-    [re.compile(" '|' |[()\":/]"),                                              " "],
+    # not-in-word apostrophes, quotes, parentheses, underscores to space
+    [re.compile(" '|' |[()\":/_]"),                                             " "],
+    # zap all single characters except 'I' and 'a'
+    [re.compile(" [^IAa,] "),                                                   " "],
+    # remove only numbers
+    [re.compile(" [-0-9, ]*[0-9][-0-9, ]* "),                                   " "],
     # zap all words without at least one lowercase letter
     # NOTE: no way to handle ALL CAPS WORDS correctly: proper nouns should be like 'John',
     # the rest should be lowercase, and we don't want to suggest all caps later, so we
     # can't keep it that way either
-    [re.compile(" [^a-z]+ "),                                                   " "],
+    [re.compile(" [A-Z0-9]+ "),                                                 " _ "],
+    [re.compile(" [^a-z,]+ "),                                                  " "],
     # more than one dashes are delimiter
     [re.compile("-{2,}"),                                                       " "],
     # zap all words with invalid characters (valid: alnum, ', _, +, -)
-    [re.compile(" [^ ]*[^ a-zA-Z0-9_'+-][^ ]* "),                               " "],
-    # zap all single characters except 'I' and 'a'
-    [re.compile(" [^IAa] "),                                                    " "],
+    [re.compile(" [^ ]*[^ a-zA-Z0-9_'+-,][^ ]* "),                              " _ "],
     # zap non-alnums in front of words
-    [re.compile(" \\W+"),                                              " "],
+    [re.compile(" [^a-zA-Z0-9,]+"),                                             " "],
     # zap non-alnums at the end of words
-    [re.compile("\\W+ "),                                              " "],
+    [re.compile("[^a-zA-Z0-9,]+ "),                                             " "],
     # coalesce whitespaces
     [re.compile("\\s+"),                                                        " "]
 ]
 
-def collect_all_subsentences(basename):
-    '''Normalise a raw corpus and split into sub-sentences'''
-    input_filename = "{b}.txt".format(b=basename)
-    output_filename = "{b}.all.subs".format(b=basename)
-    words_filename = "{b}.words.pck".format(b=basename)
+# after adding 'unknown word' marker, pull together such markers if adjacent
+coalesce_unknowns = re.compile("_[ _]*_")
 
-    if os.path.isfile(words_filename) and os.path.isfile(output_filename): 
-        wordsfile = open(words_filename, "r")
-        sorted_words = cPickle.load(wordsfile)
-        wordsfile.close()
-        return sorted_words
-
-    print "Collecting subsentences; input='{i}', output='{o}'".format(i=input_filename, o=output_filename)
+def split_train_test(input_filename, train_filename, test_filename, train_ratio):
+    ''' Split an input file to train- and test-sets '''
+    print "Separating training and testing data; input='{i}', train_ratio='{r}'".format(i=input_filename, r=train_ratio)
+    if os.path.isfile(train_filename) and os.path.isfile(test_filename): 
+        return
     infile = codecs.open(input_filename, mode="r", encoding="utf-8")
-    outfile = codecs.open(output_filename, mode="w", encoding="utf-8")
-
+    trainfile = codecs.open(train_filename, mode="w", encoding="utf-8")
+    testfile = codecs.open(test_filename, mode="w", encoding="utf-8")
     total_lines = 0
-    all_words = {}
+    random.seed(1519531190)
     for sentence in infile:
+        if random.random() < train_ratio:
+            trainfile.write(sentence)
+        else:
+            testfile.write(sentence)
+
+        total_lines += 1
+        if need_progress_printout():
+            print "  Splitted; lines='{l}'".format(l=total_lines)
+
+    print "  Splitted; lines='{l}'".format(l=total_lines)
+    testfile.close()
+    trainfile.close()
+    infile.close()
+
+
+def split_to_sentences(line):
+    '''Normalises a line and returns a list of its sentences (at least one)'''
+    for rule in line_rules:
+        line = rule[0].sub(rule[1], line.rstrip("\n"))
+
+    result = []
+    for sentence in line.split("\n"):
         for rule in sentence_rules:
             sentence = rule[0].sub(rule[1], sentence)
+        sentence = sentence.strip()
+        if sentence:
+            result.append(sentence)
 
-        for subsentence in sentence.split("\n"):
-            for rule in subsentence_rules:
-                subsentence = rule[0].sub(rule[1], subsentence)
-
-            subsentence = subsentence.strip()
-            if subsentence:
-                # write the output
-                outfile.write(subsentence + "\n")
-
-                # count the words
-                for word in subsentence.split(" "):
-                    if word in all_words:
-                        all_words[word] = 1 + all_words[word]
-                    else:
-                        all_words[word] = 1
+    return result
 
 
-        total_lines = total_lines + 1
+def get_wordset(db_dict):
+    ''' Get the global word statistics '''
+    qGlobalWordList = db_dict.cursor()
+    qGlobalWordList.execute("SELECT word, termfreq, coverage, occurences FROM words_t ORDER BY occurences DESC LIMIT :nsug", { "nsug": N_sug })
+    sorted_words = map(lambda rec: { "word": rec[0], "termfreq": rec[1], "coverage": rec[2], "occurences": rec[3] },
+            qGlobalWordList.fetchall())
+    qGlobalWordList.close()
+    return sorted_words
+
+
+def collect_all_sentences(db_dict, input_filename, output_filename):
+    '''Normalise a raw corpus and split into sub-sentences'''
+    print "Collecting sentences; input='{i}', output='{o}'".format(i=input_filename, o=output_filename)
+    if os.path.isfile(output_filename): 
+        return get_wordset(db_dict) if db_dict is not None else None
+
+    infile = codecs.open(input_filename, mode="r", encoding="utf-8")
+    outfile = codecs.open(output_filename, mode="w", encoding="utf-8")
+    total_lines = 0
+    all_words = {}
+    for line in infile:
+        for sentence in split_to_sentences(line):
+            outfile.write(sentence + "\n")
+
+            # count the words
+            for word in sentence.split(" "):
+                if word in all_words:
+                    all_words[word] = 1 + all_words[word]
+                else:
+                    all_words[word] = 1
+
+
+        total_lines += 1
         if need_progress_printout():
-            print "  Processed block; lines='{l}'".format(l=total_lines)
+            print "  Collected; lines='{l}'".format(l=total_lines)
 
-    print "  Processed block; lines='{l}'".format(l=total_lines)
+    print "  Collected; lines='{l}'".format(l=total_lines)
     outfile.close()
     infile.close()
 
     # calculate the total number of words (needed for discarding the rarest ones)
     total = 0
     sorted_words = []
-    for word, count in all_words.iteritems():
-        total = total + count
-        sorted_words.append({"count": count, "word": word})
+    for word, occurences in all_words.iteritems():
+        total = total + occurences
+        sorted_words.append({"occurences": occurences, "word": word})
     del all_words
-    sorted_words.sort(key=lambda rec: rec["count"], reverse=True)
+    sorted_words.sort(key=lambda rec: rec["occurences"], reverse=True)
 
     cumulative = 0
     total = float(total)
     for idx in range(0, len(sorted_words)):
-        cumulative = cumulative + sorted_words[idx]["count"]
-        sorted_words[idx]["termfreq"] = sorted_words[idx]["count"] / total
+        cumulative = cumulative + sorted_words[idx]["occurences"]
+        sorted_words[idx]["termfreq"] = sorted_words[idx]["occurences"] / total
         sorted_words[idx]["coverage"] = cumulative * 1.0 / total
 
-    wordsfile = open(words_filename, "w")
-    cPickle.dump(sorted_words, wordsfile, -1)
-    wordsfile.close()
+    # store the global words in the dict database
+    if db_dict is not None:
+        q = db_dict.cursor()
+        q.execute("DELETE FROM words_t")
+        for word in sorted_words:
+            q.execute("INSERT INTO words_t (word, termfreq, coverage, occurences) VALUES (:word, :tf, :cov, :occurences)",
+                      { "word": word["word"], "tf": word["termfreq"], "cov": word["coverage"], "occurences": word["occurences"] })
+        q.close()
+        db_dict.commit()
 
     return sorted_words
 
 
-def collect_common_subsentences(basename):
-    '''Collect the subsentences that contain only the p_keep most frequent words'''
-    input_filename = "{b}.all.subs".format(b=basename)
-    output_filename = "{b}.common.subs".format(b=basename)
-
-    # build and cut the word list to the top-P-percent
-    words = filter(lambda rec: rec["coverage"] <= p_keep, collect_all_subsentences(basename))
+def collect_common_sentences(input_filename, output_filename, words):
+    '''Collect the sentences that contain only the p_keep most frequent words'''
+    print "Filtering sentences; input='{i}', output='{o}'".format(i=input_filename, o=output_filename)
+    # cut the word list to the top-P-percent
+    words = filter(lambda rec: rec["coverage"] <= p_keep, words)
 
     if os.path.isfile(output_filename): 
         return words
 
-    q = db_dict.cursor()
-    q.execute("DELETE FROM words_t")
-    for word in words:
-        q.execute("INSERT INTO words_t (word, occurences) VALUES (:word, :count)",
-                  { "word": word["word"], "count": word["count"] })
-    q.close()
-    db_dict.commit()
-
-    print "Filtering subsentences; input='{i}', output='{o}'".format(i=input_filename, o=output_filename)
     infile = codecs.open(input_filename, mode="r", encoding="utf-8")
     outfile = codecs.open(output_filename, mode="w", encoding="utf-8")
-
     wordset = set(map(lambda rec: rec["word"], words))
     total_lines = 0
     for sentence in infile:
-        common_words = filter(lambda word: word in wordset, sentence.rstrip("\n").split(" "))
+        # split and replace the rare words with '_'
+        common_words = map(lambda word: word if word in wordset else "_", sentence.rstrip("\n").split(" "))
         if common_words:
-            outfile.write("^ {s}\n".format(s=" ".join(common_words)))
+            # pull together multiple adjacent '_'-s (if any)
+            common_sentence = coalesce_unknowns.sub("_", " ".join(common_words))
+            outfile.write("^ {s}\n".format(s=common_sentence))
 
-        total_lines = total_lines + 1
+        total_lines += 1
         if need_progress_printout():
-            print "  Processed block; lines='{l}'".format(l=total_lines)
+            print "  Filtered; lines='{l}'".format(l=total_lines)
 
-    print "  Processed block; lines='{l}'".format(l=total_lines)
+    print "  Filtered; lines='{l}'".format(l=total_lines)
     outfile.close()
     infile.close()
     return words
 
 
-def open_dict_db(dbfile):
+def open_dict_db(db_filename):
     ''' Open the SQLite database for the dictionary, creating and initialising it if it doesn't yet exist'''
-    need_create_tables = not os.path.isfile(dbfile) 
-    db = sqlite3.connect(dbfile)
-    if need_create_tables:
+    print "Using dict db; db_filename='{f}'".format(f=db_filename) 
+    already_exists = os.path.isfile(db_filename) 
+    db = sqlite3.connect(db_filename)
+    if not already_exists:
+        # freshly created, create tables and indices
         q = db.cursor()
         q.execute('''
         CREATE TABLE words_t (
          word       TEXT,
+         termfreq   REAL,
+         coverage   REAL,
          occurences INTEGER)''')
         q.execute("CREATE INDEX words_word_i ON words_t (word)")
         q.execute("CREATE INDEX words_occurences_i ON words_t (occurences)")
@@ -227,43 +274,34 @@ def open_dict_db(dbfile):
         q.close()
         db.commit()
 
-    return db
+    return (db, already_exists)
 
-def open_ngram_db(dbfile):
-    ''' Open the SQLite database for the ngrams, creating and initialising it if it doesn't yet exist'''
-    db = sqlite3.connect(dbfile)
-    q = db.cursor()
-    q.execute("DROP INDEX IF EXISTS ngram_i")
-    q.execute("DROP TABLE IF EXISTS ngram_t")
-    q.execute('''
-    CREATE TABLE ngram_t (
-     prefix     TEXT,
-     follower   TEXT,
-     occurences INTEGER)''')
-    q.execute("CREATE INDEX ngram_i ON ngram_t (prefix, follower)")
-    q.close()
-    db.commit()
 
-    return db
+def open_ngram_db(db_filename):
+    ''' Open the SQLite database for the N-grams, creating and initialising it if it doesn't yet exist'''
+    print "Using ngram db; db_filename='{f}'".format(f=db_filename) 
+    already_exists = os.path.isfile(db_filename) 
+    db = sqlite3.connect(db_filename)
+    if not already_exists:
+        # freshly created, create tables and indices
+        q = db.cursor()
+        q.execute("DROP INDEX IF EXISTS ngram_i")
+        q.execute("DROP TABLE IF EXISTS ngram_t")
+        q.execute('''
+        CREATE TABLE ngram_t (
+         prefix     TEXT,
+         follower   TEXT,
+         occurences INTEGER)''')
+        q.execute("CREATE INDEX ngram_i ON ngram_t (prefix, follower)")
+        q.close()
+        db.commit()
 
-db_dict = open_dict_db("dict.db")
-db_ngram = None
+    return (db, already_exists)
 
-def collect_ngrams(basename, n):
+
+def collect_ngrams(db_ngram, input_filename, n):
     ''' Collect the n-grams from the given corpus '''
-    global db_ngram
-
-    db_filename = "{b}.{n}.db".format(b=basename, n=n)
-    input_filename = "{b}.common.subs".format(b=basename)
-    
-    # get the global words distribution
-    words = collect_common_subsentences(basename)
-    
     print "Collecting ngrams; infile='{i}', n='{n}'".format(i=input_filename, n=n) 
-
-    # (re-)create the ngram database
-    db_ngram = open_ngram_db(db_filename)
-
     infile = open(input_filename, "r")
     qIncNgramCounter = db_ngram.cursor()
     qNewNgram = db_ngram.cursor()
@@ -271,83 +309,76 @@ def collect_ngrams(basename, n):
     for line in infile:
         t = line.rstrip("\n").split(" ")
         nt = len(t)
-        #print "Input; nt='{nt}', tokens='{t}'".format(nt=nt, t=" ".join(t)) 
         if nt > n:
             for start in range(0, nt - n):
                 record = { "prefix": " ".join(t[start : (start + n)]), "follower": t[start + n] }
-                #print "prefix='{p}', follower='{f}'".format(p=record["prefix"], f=record["follower"])
                 qIncNgramCounter.execute('UPDATE ngram_t SET occurences = occurences + 1 WHERE prefix=:prefix AND follower=:follower', record)
                 if qIncNgramCounter.rowcount <= 0:
                     qNewNgram.execute('INSERT INTO ngram_t (prefix, follower, occurences) VALUES (:prefix, :follower, 1)', record)
 
-        total_lines = total_lines + 1
+        total_lines += 1
         if need_progress_printout():
-            print "  Processed block; lines='{l}'".format(l=total_lines)
-    print "  Processed block; lines='{l}'".format(l=total_lines)
+            print "  N-gram gen; n='{n}', lines='{l}'".format(n=n, l=total_lines)
+    print "  N-gram gen; n='{n}', lines='{l}'".format(n=n, l=total_lines)
+    db_ngram.commit()
     qIncNgramCounter.close()
     qNewNgram.close()
-    db_ngram.commit()
     infile.close()
-    return words
+
+
+def DL_cost(s, t, i, j, v0, v1, v2):
+    ''' Damerau-Levenshtein cost function '''
+    # D-L-dist cost function: https://en.wikipedia.org/wiki/Damerau%E2%80%93Levenshtein_distance#Definition
+    # s, t are the strings; i, j are the current matrix position; v0, v1, v2 are the current, the previous,
+    # and the one-before-previous matrix lines 
+    delCost = v0[j + 1] + 1
+    insCost = v1[j] + 1
+    sbsCost = v0[j] if s[i] == t[j] else v0[j] + 1
+    swpCost = (v2[j - 1] + 1) if (i > 0) and (j > 0) and (s[i] == t[j - 1]) and (s[i - 1] == t[j]) else 999999
+    return min(delCost, insCost, sbsCost, swpCost)
 
 
 def DL_distance(s, t):
     ''' Damerau-Levenshtein distance of lists '''
-    # This version uses 3 rows of storage, analoguous to the 2-row L-distance algorithm
-    #
-    # Iterative L-dist with 2 rows of storage: https://en.wikipedia.org/wiki/Levenshtein_distance#Iterative_with_two_matrix_rows
-    # D-L-dist cost function: https://en.wikipedia.org/wiki/Damerau%E2%80%93Levenshtein_distance#Definition
+    # This version uses 3 rows of storage, analoguous to the 2-row L-distance algorithm:
+    # https://en.wikipedia.org/wiki/Levenshtein_distance#Iterative_with_two_matrix_rows
     m = len(s)
     n = len(t)
 
     v0 = range(0, n + 1)
+    v2 = []
     i = 0
     while True:
         v1 = [i + 1]
         for j in range(0, n):
-            delCost = v0[j + 1] + 1
-            insCost = v1[j] + 1
-            sbsCost = v0[j] if s[i] == t[j] else v0[j] + 1
-            swpCost = (v2[j - 1] + 1) if (i > 0) and (j > 0) and (s[i] == t[j - 1]) and (s[i - 1] == t[j]) else 999999
-            v1.append(min(delCost, insCost, sbsCost, swpCost))
+            v1.append(DL_cost(s, t, i, j, v0, v1, v2))
 
-        i = i + 1
+        i += 1
         if i >= m:
             return v1[n]
 
         v2 = [i + 1]
         for j in range(0, n):
-            delCost = v1[j + 1] + 1
-            insCost = v2[j] + 1
-            sbsCost = v1[j] if s[i] == t[j] else v1[j] + 1
-            swpCost = (v0[j - 1] + 1) if (i > 0) and (j > 0) and (s[i] == t[j - 1]) and (s[i - 1] == t[j]) else 999999
-            v2.append(min(delCost, insCost, sbsCost, swpCost))
+            v2.append(DL_cost(s, t, i, j, v1, v2, v0))
 
-        i = i + 1
+        i += 1
         if i >= m:
             return v2[n]
 
         v0 = [i + 1]
         for j in range(0, n):
-            delCost = v2[j + 1] + 1
-            insCost = v0[j] + 1
-            sbsCost = v2[j] if s[i] == t[j] else v2[j] + 1
-            swpCost = (v1[j - 1] + 1) if (i > 0) and (j > 0) and (s[i] == t[j - 1]) and (s[i - 1] == t[j]) else 999999
-            v0.append(min(delCost, insCost, sbsCost, swpCost))
+            v0.append(DL_cost(s, t, i, j, v2, v0, v1))
 
-        i = i + 1
+        i += 1
         if i >= m:
             return v0[n]
 
 
-def process_ngrams(basename, n):
+def process_ngrams(db_ngram, db_dict, words):
     ''' Process the n-grams and update the dictionary with them '''
-    global db_ngram
-    global db_dict
-
+    print "Processing ngrams;"
     # get the top-N_sug words from the global distribution
-    global_suggestion = map(lambda x: x["word"], collect_ngrams(basename, n)[0:N_sug])
-    print "global suggestion: {x}".format(x=global_suggestion)
+    global_suggestion = map(lambda x: x["word"], words[0:N_sug])
 
     # get the current dictionary size, so we won't have to query it again and again
     q = db_dict.cursor()
@@ -366,7 +397,7 @@ def process_ngrams(basename, n):
             qNewDictItem.execute("INSERT INTO dict_t (prefix, suggestion, value) VALUES (:prefix, :suggestion, :value)",
                                  { "prefix": prefix, "suggestion": " ".join(suggestion), "value": value })
             dict_stats["total_value"] = dict_stats["total_value"] + value
-            dict_stats["size"] = dict_stats["size"] + 1
+            dict_stats["size"] += 1
 
     qAddDictValue = db_dict.cursor()
     def add_dict_value(prefix, value):
@@ -427,7 +458,7 @@ def process_ngrams(basename, n):
                     # however, this makes its parent more valuable
                     add_dict_value(parent_prefix, value)
             else:
-                # this suggestion is worth storing, the cheapest must be discarded
+                # this suggestion is worth storing, the cheapest will be discarded
                 add_new_item(prefix, suggestion, value)
                 # but it makes the parent of the cheapest one more valuable
                 (parent_prefix, parent_suggestion) = find_parent_for(cheapest_prefix)
@@ -438,9 +469,10 @@ def process_ngrams(basename, n):
                 dict_stats["total_value"] = dict_stats["total_value"] - cheapest_value
                 dict_stats["size"] = dict_stats["size"] - 1
 
-        total_lines = total_lines + 1
+        total_lines += 1
         if need_progress_printout():
-            print "Dict; lines='{l}', size='{s}', value='{v}'".format(l=total_lines, s=dict_stats["size"], v=dict_stats["total_value"])
+            print "Dict update; lines='{l}', size='{s}', value='{v}'".format(l=total_lines, s=dict_stats["size"], v=dict_stats["total_value"])
+    print "Dict update; lines='{l}', size='{s}', value='{v}'".format(l=total_lines, s=dict_stats["size"], v=dict_stats["total_value"])
 
     qPrefixes.close()
     qFollowers.close()
@@ -452,18 +484,137 @@ def process_ngrams(basename, n):
     db_dict.commit()
 
 
-#collect_common_subsentences(basename(locale, "blogs"))
-for n in range(1, 6):
-    process_ngrams(basename(locale, "blogs"), n)
+##############################################################################
+# The training process
+#
 
-db_dict.close()
-if db_ngram is not None:
-    db_ngram.close()
+def train_input(dict_db_filename, basename):
+    ''' The whole training process from original input to dictionary db '''
+    orig_input_filename = "{b}.txt".format(b=basename)
+    train_filename = "{b}.train.txt".format(b=basename)
+    test_filename = "{b}.test.txt".format(b=basename)
+    all_sentences_filename = "{b}.all.sentences".format(b=basename)
+    common_sentences_filename = "{b}.common.sentences".format(b=basename)
+
+    # open the dict database (global wordlist will be stored there as well)
+    (db_dict, _) = open_dict_db(dict_db_filename)
+    # split the input to 80% train + 20% test
+    split_train_test(orig_input_filename, train_filename, test_filename, 0.8)
+    # get the global words distribution
+    words = collect_all_sentences(db_dict, train_filename, all_sentences_filename)
+    # filter for the common words
+    words = collect_common_sentences(all_sentences_filename, common_sentences_filename, words)
+
+    for n in range(1, 5):
+        ngram_db_filename = "{b}.{n}.db".format(b=basename, n=n)
+        (db_ngram, already_exists) = open_ngram_db(ngram_db_filename)
+        if not already_exists:
+            # build the n-grams
+            collect_ngrams(db_ngram, common_sentences_filename, n)
+        # update the dictionary with the n-grams
+        process_ngrams(db_ngram, db_dict, words)
+        db_ngram.close()
+
+    # close the dict database
+    db_dict.close()
 
 
-#collect_subsentences("sample")
-#words_blogs = collect_subsentences(basename(locale, "blogs")) %>% mutate(src="blogs")
-#words_news = collect_subsentences(basename(locale, "news")) %>% mutate(src="news")
-#words_twitter = collect_subsentences(basename(locale, "twitter")) %>% mutate(src="twitter")
+train_input("dict.db", "final/{l}/{l}.{s}".format(l="en_US", s="blogs"))
+
+
+##############################################################################
+# Using the model
+#
+
+def get_suggestions(db_dict, sentence, qLookupPrefix = None):
+    ''' Get the suggestion list for a normalised sentence '''
+    # NOTE: for large-scale testing performance a reuseable cursor can be provided
+    use_local_cursor = qLookupPrefix is None
+    if use_local_cursor:
+        qLookupPrefix = db_dict.cursor()
+
+    if type(sentence) == str:
+        sentence = sentence.split(" ")
+
+    # try each line suffix as suggestion prefix
+    for i in range(0, len(sentence)):
+        qLookupPrefix.execute("SELECT suggestion FROM dict_t WHERE prefix=:prefix",
+                              { "prefix": " ".join(sentence[i:]) })
+        if qLookupPrefix.rowcount > 0:
+            suggestions = qLookupPrefix.fetchone()[0]
+            if use_local_cursor:
+                qLookupPrefix.close()
+            return suggestions.split(" ")
+
+    # tough luck, no prefix found, let the caller dig up the defaults
+    return None
+
+
+##############################################################################
+# The testing process
+#
+
+def test_suggestions(dict_db_filename, basename, result_csv_name):
+    ''' The whole training process from original input to dictionary db '''
+    test_filename = "{b}.test.txt".format(b=basename)
+    all_sentences_filename = "test.all.sentences"
+    common_sentences_filename = "test.common.sentences"
+
+    # open the dict database
+    (db_dict, _) = open_dict_db(dict_db_filename)
+    # get the global suggestions
+    words = get_wordset(db_dict)
+    default_suggestions = map(lambda x: x["word"], words)[:N_sug]
+
+    # NOTE: In normal operation we would normalise the typed sentence
+    # and get suggestions at its end
+    #
+    # Now for testing we normalise the test sentenes, and get suggestions
+    # for all their word boundaries.
+
+    # normalise the test file
+    words = collect_all_sentences(None, train_filename, all_sentences_filename)
+    words = collect_common_sentences(all_sentences_filename, common_sentences_filename, words)
+
+    # initialise the hit counters
+    hit = [ 0 for i in range(N_sug) ]
+    miss = 0
+
+    infile = codecs.open(common_sentences_filename, mode="r", encoding="utf-8")
+    total_lines = 0
+    q = db_dict.cursor() # reuseable cursor for performance
+    for sentence in infile:
+        sentence_words = sentence.split(" ")
+
+        for w in range(0, len(sentence_words) - 1):
+            real_word = sentence_words[w + 1]
+
+            suggestions = get_suggestions(db_dict, sentence[:w], q)
+            if suggestions is None:
+                suggestions = default_suggestions
+
+            miss += 1 # book as missed by default
+            for i in range(N_sug):
+                if real_word == suggestions[i]:
+                    miss -= 1
+                    hit[i] += 1
+            
+        total_lines += 1
+        if need_progress_printout():
+            print "  Checked; lines='{l}'".format(l=total_lines)
+
+    print "  Checked; lines='{l}'".format(l=total_lines)
+    infile.close()
+    db_dict.close()
+    
+    # write the output file
+    outfile = codecs.open(result_csv_name, mode="w", encoding="utf-8")
+    hits_header = ", ".join([ "\"hit{i}\"" for i in range(N_sug) ])
+    outfile.write("\"miss\",{h}\n".format(h=hits_header))
+    hits_value = ", ".join([ "\"{h}\"" for h in hit ])
+    outfile.write("\"{m}\",{h}\n".format(m=miss, h=hits_value))
+    outfile.close()
+
+test_suggestions("dict.db", "final/{l}/{l}.{s}".format(l="en_US", s="blogs"), "test_results.csv")
 
 # vim: set et ts=4 sw=4:
