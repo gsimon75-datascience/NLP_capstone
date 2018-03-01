@@ -20,10 +20,10 @@ p_discard = 0.1
 p_keep = 1 - p_discard
 
 # Maximal size of the suggestion dictionary
-N_max = 200000
+N_max = 2000000
 
 # Maximal prefix N-gram size
-N_max_prefix_size = 4
+N_max_prefix_size = 7
 
 ##############################################################################
 # Logging
@@ -227,7 +227,8 @@ def open_ngram_db(db_filename):
 def get_wordset(db_dict):
     ''' Get the global word statistics '''
     qGlobalWordList = db_dict.cursor()
-    qGlobalWordList.execute("SELECT word, termfreq, coverage, occurences FROM words_t ORDER BY occurences DESC LIMIT :nsug", {"nsug": N_sug})
+    #qGlobalWordList.execute("SELECT word, termfreq, coverage, occurences FROM words_t ORDER BY occurences DESC LIMIT :nsug", {"nsug": N_sug})
+    qGlobalWordList.execute("SELECT word, termfreq, coverage, occurences FROM words_t ORDER BY occurences DESC")
     sorted_words = map(lambda rec: {"word": rec[0], "termfreq": rec[1], "coverage": rec[2], "occurences": rec[3]},
                        qGlobalWordList.fetchall())
     qGlobalWordList.close()
@@ -539,6 +540,7 @@ def train_input(dict_db_filename, basename):
         # update the dictionary with the n-grams
         process_ngrams(db_ngram, db_dict, words)
         db_ngram.close()
+        os.unlink(ngram_db_filename)
 
     # close the dict database
     db_dict.close()
@@ -562,6 +564,7 @@ def get_suggestions(db_dict, sentence, qLookupPrefix=None):
     for i in range(0, len(sentence)):
         qLookupPrefix.execute("SELECT suggestion FROM dict_t WHERE prefix=:prefix",
                               {"prefix": " ".join(sentence[i:])})
+        log.debug("Looked up prefix; rowcount='{n}', p='{p}'".format(n=qLookupPrefix.rowcount, p=" ".join(sentence[i:])))
         if qLookupPrefix.rowcount > 0:
             suggestions = qLookupPrefix.fetchone()[0]
             if use_local_cursor:
