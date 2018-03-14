@@ -33,7 +33,7 @@ train_ratio = 1.0
 log = logging.getLogger("Main")
 formatter = logging.Formatter('%(asctime)s.%(msecs).03d - %(name)s - %(levelname)8s - %(message)s', datefmt='%H:%M:%S')
 
-file_handler = logging.FileHandler("test.log", mode="w", encoding="UTF8")
+file_handler = logging.FileHandler("build.log", mode="w", encoding="UTF8")
 file_handler.setFormatter(formatter)
 log.addHandler(file_handler)
 
@@ -979,8 +979,8 @@ def test_suggestions(dict_db_filename, basename, result_csv_name):
 # MAIN
 #
 
-train_input("test.db", "sample")
-#train_input("dict.db", "final/en_US/all")
+#train_input("test.db", "sample")
+train_input("/mnt/dict.db", "final/en_US/all")
 #train_input("dict.db", "final/{l}/{l}.{s}".format(l="en_US", s="news"))
 #train_input("dict.db", "final/{l}/{l}.{s}".format(l="en_US", s="twitter"))
 
