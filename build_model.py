@@ -554,7 +554,7 @@ def collect_ngrams(db, input_filename, n):
     # be committed alone, or everything must be cached
 
     # `prefixes` is the cache of prefix_t in a tree representation:
-    # { word: { "id": id, "word": word_id, "occurences": occurence_count, "children": { ...} } }
+    # { word: [id, occurence_count, {children}], ... }
     prefixes = {}
     next_prefix_id = 1
     total_lines = 0
@@ -570,10 +570,12 @@ def collect_ngrams(db, input_filename, n):
                 for i in range(1, pmax + 1):
                     w = t[f - i]
                     if not w in p:
-                        p[w] = { "id": next_prefix_id, "occurences": 1, "children": {} }
+                        p[w] = [ next_prefix_id, 1, {} ]
                         next_prefix_id += 1
-                    qNgramCounter.increment(1, p[w]["id"], follower)
-                    p = p[w]["children"]
+                    else:
+                        p[w][1] += 1
+                    qNgramCounter.increment(1, p[w][0], follower)
+                    p = p[w][2]
 
             total_lines += 1
             if need_progress_printout():
@@ -591,12 +593,12 @@ def collect_ngrams(db, input_filename, n):
     def commit_prefixes(parent_id, p):
         for word, rec in p.iteritems():
             qCommitPrefixes.execute("INSERT INTO prefix_t (id, parent, word, occurences) VALUES (:id, :parent, :word, :occurences)",
-                                    {"id": rec["id"], "parent": parent_id, "word": word, "occurences": rec["occurences"]})
+                                    {"id": rec[0], "parent": parent_id, "word": word, "occurences": rec[1]})
             total_lines[0] += 1
             if need_progress_printout():
                 log.debug("  Prefix commit; done='{t}', total='{n}'".format(t=total_lines[0], n=next_prefix_id))
-            commit_prefixes(rec["id"], rec["children"])
-            rec["children"] = None
+            commit_prefixes(rec[0], rec[2])
+            rec[2] = None
 
     log.info("Committing prefixes; n='{n}'".format(n=next_prefix_id))
     commit_prefixes(0, prefixes)
