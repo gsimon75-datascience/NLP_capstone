@@ -3,12 +3,15 @@ import re
 import os
 import os.path
 import logging
-from time import time
+from time import time, sleep
 import random
 import codecs
 import sqlite3
 import cPickle
 import sys
+import psutil
+from psutil import _psutil_linux as pslin
+import gc
 
 ##############################################################################
 # Parameters
@@ -21,7 +24,7 @@ N_sug = 4
 N_max = 2000000
 
 # Maximal prefix N-gram size
-N_max_prefix_size = 4
+N_max_prefix_size = 3
 
 # 90% training, 10% testing
 train_ratio = 1.0
@@ -51,6 +54,9 @@ else:
 # Parts of the training process
 #
 
+# retain some memory. don't know how much, from how much total, and what for
+# all mem-related stats have at least three different interpretations
+min_free_mb = 1024
 
 # Normalisation regexes for whole lines - may produce line breaks
 line_rules = [
@@ -197,6 +203,17 @@ def sql_progress():
     progress_counter += progress_delta
     log.debug("SQL progress; steps='{n}M'".format(n=progress_counter))
 
+free_mb = 0
+def near_oom():
+    global free_mb
+    free_mb = psutil.virtual_memory().available >> 20
+    return free_mb <= min_free_mb
+
+
+def dump_memstat():
+    log.debug("psutil.virtual_memory() = {x}".format(x=psutil.virtual_memory()))
+    log.debug("pslin.linux_sysinfo() = {x}".format(x=pslin.linux_sysinfo()))
+
 
 def open_dict_db(db_filename):
     ''' Open the SQLite database for the dictionary, creating and initialising it if it doesn't yet exist'''
@@ -289,6 +306,7 @@ class CounterUpdater:
         if level is None:
             level = self.num_keys
             log.debug("Committing cache;")
+            dump_memstat()
             self.progress = 0
             cachelevel = self.cache
 
@@ -308,12 +326,17 @@ class CounterUpdater:
                 self.commit_cache(level-1, v, params)
                 cachelevel[k] = None
         del params[-1]
+        cachelevel.clear()
 
         if level == self.num_keys:
             log.debug("  Committed; keys='{t}', cache_size='{n}'".format(t=self.progress, n=self.cache_size))
-            self.db.commit()
-            self.cache = {}
+            dump_memstat()
+            self.cache.clear()
             self.cache_size = 0
+            gc.collect()
+            self.db.commit()
+            log.debug("  Flushed cache;")
+            dump_memstat()
 
     def increment(self, by, *args):
         x = self.cache
@@ -327,14 +350,26 @@ class CounterUpdater:
         else:
             x[args[-1]] = by
             self.cache_size += 1
-            if self.cache_size >= self.cache_max_size:
+            #if self.cache_size >= self.cache_max_size:
+            if near_oom():
+                log.debug("Near OOM;")
+                dump_memstat()
                 self.commit_cache()
+                gc.collect()
+                self.db.commit()
+                while near_oom():
+                    log.error("Still near OOM; free_mb='{f}'".format(f=free_mb))
+                    dump_memstat()
+                    gc.collect()
+                    self.db.commit()
+                    sleep(1)
 
     def close(self):
         self.commit_cache()
         self.qIncrEntry.close()
         self.qNewEntry.close()
-
+        gc.collect()
+        self.db.commit()
 
 
 def split_train_test(input_filename, train_filename, test_filename, train_ratio):
@@ -382,7 +417,7 @@ def get_wordset(db):
     ''' Get the global word statistics '''
     qGlobalWordList = db.cursor()
     qGlobalWordList.execute("SELECT id, word FROM word_t")
-    words = map(lambda rec: {"id": int(rec[0]), "word": rec[1]}, qGlobalWordList.fetchall())
+    words = map(lambda rec: (int(rec[0]), rec[1]), qGlobalWordList.fetchall())
     qGlobalWordList.close()
     return words
 
@@ -392,7 +427,7 @@ def normalise_sentences(db, input_filename, output_filename, collect_words=True)
 
     if os.path.isfile(output_filename):
         log.info("Using normalised sentences; output='{o}'".format(o=output_filename))
-        return get_wordset(db)
+        return
 
     temp_filename = "{of}.temp".format(of=output_filename)
     log.info("Collecting sentences; input='{i}', output='{o}'".format(i=input_filename, o=temp_filename))
@@ -416,7 +451,7 @@ def normalise_sentences(db, input_filename, output_filename, collect_words=True)
     outfile.close()
     infile.close()
 
-    words = [ {"id": 0, "word": "^"}, {"id":1, "word": ","} ] if collect_words else get_wordset(db)
+    words = [ (0, "^"), (1, ",") ] if collect_words else get_wordset(db)
     if collect_words:
         # coalesce the words that differ only in capitalisation: less caps letters wins
         wordset = map(lambda w: (w.lower(), w), wordset)
@@ -436,30 +471,24 @@ def normalise_sentences(db, input_filename, output_filename, collect_words=True)
         for word in wordset:
             if not word in indexed:
                 indexed.add(word)
-                words.append({"id": i, "word": word})
+                words.append((i, word))
                 i += 1
 
         # store the global words in the dict database
         q = db.cursor()
-        q.executemany("INSERT INTO word_t (id, word) VALUES (:id, :word)", words)
+        q.executemany("INSERT INTO word_t (id, word) VALUES (?1, ?2)", words)
         q.close()
         db.commit()
 
     log.info("Normalising sentences; input='{i}', output='{o}'".format(i=temp_filename, o=output_filename))
-    wordset = dict(map(lambda w: (w["word"].lower(), w["id"]), words))
-
-    def normalise_caps(w):
-        wl = w.lower()
-        if wl in wordset:
-            return wordset[wl]
-        return -1
+    words = dict(map(lambda w: (w[1].lower(), w[0]), words))
 
     infile = codecs.open(temp_filename, mode="r", encoding="utf-8")
     outfile = open(output_filename, mode="wb")
     total_lines = 0
     for sentence in infile:
         # split and replace the rare words with '_'
-        sentence_words = filter(lambda i: i >= 0, map(lambda word: normalise_caps(word), sentence.rstrip("\n").split(" ")))
+        sentence_words = map(lambda w: words[w], filter(lambda w: w in words, sentence.rstrip("\n").lower().split(" ")))
         if sentence_words:
             cPickle.dump(sentence_words, outfile, -1)
 
@@ -471,20 +500,13 @@ def normalise_sentences(db, input_filename, output_filename, collect_words=True)
     outfile.close()
     infile.close()
     os.unlink(temp_filename)
-    return words
 
 
-def collect_bayes_factors(db, input_filename, words):
+def collect_bayes_factors(db, input_filename):
     ''' Collect the Bayes-factor matrix '''
-
-    N = len(words)
-    log.info("Collecting Bayes factors; infile='{i}', num_words='{n}'".format(i=input_filename, n=N))
-    if N <= 0:
-        log.critical("No known words, you should rebuild the word db;")
-        sys.exit(1)
-
-    # iterate through the sentences and occurences the words that occur in the same sentence
-    qBayesCounter = CounterUpdater(16777216, db, "bayes_t", "occurences", "condition", "conditional")
+    log.info("Collecting Bayes factors; infile='{i}'".format(i=input_filename))
+    # iterate through the sentences and count the words that occur in the same sentence
+    qBayesCounter = CounterUpdater(0x4000000, db, "bayes_t", "occurences", "condition", "conditional")
     infile = open(input_filename, "rb")
     total = 0
     total_lines = 0
@@ -494,8 +516,12 @@ def collect_bayes_factors(db, input_filename, words):
             nw = len(w)
             for i in range(nw - 1):
                 iidx = w[i]
+                if iidx <= 1:
+                    continue  # skip ^ and ,
                 for j in range(i + 1, nw):
                     jidx = w[j]
+                    if jidx <= 1:
+                        continue  # skip ^ and ,
                     qBayesCounter.increment(1, iidx, jidx)
                     total += 1
                     if iidx != jidx:
@@ -512,24 +538,23 @@ def collect_bayes_factors(db, input_filename, words):
     qBayesCounter.close()
 
     # convert count(AB) terms to Bayes factor P(B|A) / P(B|#A)
-    qBayesFactors = CounterUpdater(16777216, db, "bayes_t", "factor", "condition", "conditional")
+    qBayesFactors = db.cursor();
     q = db.cursor()
     q.execute("SELECT condition, SUM(occurences) FROM bayes_t GROUP BY condition")
     word_counts = dict((int(x[0]), float(x[1])) for x in q.fetchall())
-    total = sum(word_counts.values())
+    total = float(sum(word_counts.values()))
     N = len(word_counts)
     for i, ci in word_counts.iteritems():
         if need_progress_printout():
             log.debug("  Bayes; row='{i}', of='{n}'".format(i=i, n=N))
-        total_ci_m1 = (float(total) / ci) - 1
-        q.execute("SELECT conditional, occurences FROM bayes_t WHERE condition=:i", {"i": i})
+        total_ci_m1 = (total / ci) - 1
+        q.execute("SELECT conditional, occurences FROM bayes_t WHERE condition=?1", (i,))
         for rec in q.fetchall():
             j = rec[0]
             occurences = rec[1]
             cj = word_counts[j]
             if cj != occurences:
-                factor = total_ci_m1 / ((cj / occurences) - 1)
-                qBayesFactors.increment(factor, i, j)
+                qBayesFactors.execute("UPDATE bayes_t SET factor=?3 WHERE condition=?1 AND conditional=?2", (i, j, total_ci_m1 / ((cj / occurences) - 1)))
             # NOTE: NULL means Inf, will read as None
 
     qBayesFactors.close()
@@ -539,12 +564,13 @@ def collect_bayes_factors(db, input_filename, words):
 
 def collect_ngrams(db, input_filename, n):
     ''' Collect the n-grams from the given corpus '''
+    global free_mb
     log.info("Collecting ngrams; infile='{i}'".format(i=input_filename))
     infile = open(input_filename, "rb")
 
     # NOTE: small caches, we'll need the ram for the prefixes
-    qFollowerCounter = CounterUpdater(1048576, db, "word_t", "occurences", "id")
-    qNgramCounter = CounterUpdater(1048576, db, "ngram_t", "occurences", "prefix", "follower")
+    qFollowerCounter = CounterUpdater(0x1000000, db, "word_t", "occurences", "id")
+    qNgramCounter = CounterUpdater(0x1000000, db, "ngram_t", "occurences", "prefix", "follower")
     
     # NOTE: when recording a prefix, the following steps are needed:
     # 1. if it exists, its occurence count must be increased
@@ -560,26 +586,29 @@ def collect_ngrams(db, input_filename, n):
     total_lines = 0
     try:
         while True:
-            t = cPickle.load(infile)
-            nt = len(t)
-            pmax = min(n, nt - 1)
-            for f in range(1, nt):
-                follower = t[f]
+            w = cPickle.load(infile)
+            nw = len(w)
+            for f in range(1, nw):
+                follower = w[f]
                 qFollowerCounter.increment(1, follower)
+                pmax = min(n, f - 1)
                 p = prefixes
                 for i in range(1, pmax + 1):
-                    w = t[f - i]
-                    if not w in p:
-                        p[w] = [ next_prefix_id, 1, {} ]
+                    word = w[f - i]
+                    if not word in p:
+                        p[word] = [ next_prefix_id, 1 ]
                         next_prefix_id += 1
                     else:
-                        p[w][1] += 1
-                    qNgramCounter.increment(1, p[w][0], follower)
-                    p = p[w][2]
+                        p[word][1] += 1
+                    qNgramCounter.increment(1, p[word][0], follower)
+                    if i < pmax:
+                        if len(p[word]) < 3:
+                            p[word].append({})
+                        p = p[word][2]
 
             total_lines += 1
             if need_progress_printout():
-                log.debug("  N-gram gen; lines='{l}', prefixes='{p}'".format(l=total_lines, p=next_prefix_id))
+                log.debug("  N-gram gen; lines='{l}', prefixes='{p}', mem='{m}'".format(l=total_lines, p=next_prefix_id, m=pslin.linux_sysinfo()))
     except EOFError:
         pass
     log.info("  N-gram gen; lines='{l}', prefixes='{p}'".format(l=total_lines, p=next_prefix_id))
@@ -592,13 +621,13 @@ def collect_ngrams(db, input_filename, n):
     total_lines = [0]
     def commit_prefixes(parent_id, p):
         for word, rec in p.iteritems():
-            qCommitPrefixes.execute("INSERT INTO prefix_t (id, parent, word, occurences) VALUES (:id, :parent, :word, :occurences)",
-                                    {"id": rec[0], "parent": parent_id, "word": word, "occurences": rec[1]})
+            qCommitPrefixes.execute("INSERT INTO prefix_t (id, parent, word, occurences) VALUES (?1, ?2, ?3, ?4)", (rec[0], parent_id, word, rec[1]))
             total_lines[0] += 1
             if need_progress_printout():
                 log.debug("  Prefix commit; done='{t}', total='{n}'".format(t=total_lines[0], n=next_prefix_id))
-            commit_prefixes(rec[0], rec[2])
-            rec[2] = None
+            if len(rec) >= 3:
+                commit_prefixes(rec[0], rec[2])
+                rec[2] = None
 
     log.info("Committing prefixes; n='{n}'".format(n=next_prefix_id))
     commit_prefixes(0, prefixes)
@@ -613,169 +642,10 @@ def calculate_ngram_factors(db):
     total = q.fetchone()[0]
     q.execute('''
     INSERT OR REPLACE INTO ngram_t (prefix, follower, occurences, factor)
-        SELECT n.prefix, n.follower, n.occurences, ((:total / pfx.occurences) - 1) / ((flw.occurences / n.occurences) - 1) AS factor
-        FROM ngram_t n INNER JOIN word_t flw ON n.follower = flw.id INNER JOIN prefix_t pfx ON n.prefix = pfx.id''', {"total": total} )
+        SELECT n.prefix, n.follower, n.occurences, ((?1 / pfx.occurences) - 1) / ((flw.occurences / n.occurences) - 1) AS factor
+        FROM ngram_t n INNER JOIN word_t flw ON n.follower = flw.id INNER JOIN prefix_t pfx ON n.prefix = pfx.id''', (total,) )
     log.debug("Calculated N-gram Bayes factors; total='{t}', rows='{r}'".format(t=total, r=q.rowcount))
     db.commit()
-
-
-#def DL_cost(s, t, i, j, v0, v1, v2):
-#    ''' Damerau-Levenshtein cost function '''
-#    # D-L-dist cost function: https://en.wikipedia.org/wiki/Damerau%E2%80%93Levenshtein_distance#Definition
-#    # s, t are the strings; i, j are the current matrix position; v0, v1, v2 are the current, the previous,
-#    # and the one-before-previous matrix lines
-#    delCost = v0[j + 1] + 2
-#    insCost = v1[j] + 2
-#    sbsCost = v0[j] if s[i] == t[j] else v0[j] + 3
-#    swpCost = (v2[j - 1] + 1) if (i > 0) and (j > 0) and (s[i] == t[j - 1]) and (s[i - 1] == t[j]) else 999999
-#    return min(delCost, insCost, sbsCost, swpCost)
-#
-#
-#def DL_distance(s, t):
-#    ''' Damerau-Levenshtein distance of lists '''
-#    # This version uses 3 rows of storage, analoguous to the 2-row L-distance algorithm:
-#    # https://en.wikipedia.org/wiki/Levenshtein_distance#Iterative_with_two_matrix_rows
-#    m = len(s)
-#    n = len(t)
-#
-#    v0 = range(0, n + 1)
-#    v2 = []
-#    i = 0
-#    while True:
-#        v1 = [i + 1]
-#        for j in range(0, n):
-#            v1.append(DL_cost(s, t, i, j, v0, v1, v2))
-#
-#        i += 1
-#        if i >= m:
-#            return v1[n]
-#
-#        v2 = [i + 1]
-#        for j in range(0, n):
-#            v2.append(DL_cost(s, t, i, j, v1, v2, v0))
-#
-#        i += 1
-#        if i >= m:
-#            return v2[n]
-#
-#        v0 = [i + 1]
-#        for j in range(0, n):
-#            v0.append(DL_cost(s, t, i, j, v2, v0, v1))
-#
-#        i += 1
-#        if i >= m:
-#            return v0[n]
-#
-#
-#def process_ngrams(db, db, words):
-#    ''' Process the n-grams and update the dictionary with them '''
-#    log.info("Processing ngrams;")
-#    # get the top-N_sug words from the global distribution
-#    global_suggestion = map(lambda x: x["word"], words[0:N_sug])
-#
-#    # get the current dictionary size, so we won't have to query it again and again
-#    q = db.cursor()
-#    q.execute("SELECT COUNT(*), SUM(value) FROM dict_t")
-#    stats = q.fetchone()
-#    dict_stats = {"size": stats[0], "total_value": stats[1]}
-#    dict_stats["size"] = stats[0]
-#    dict_stats["total_value"] = 0 if stats[1] is None else stats[1]
-#    q.close()
-#
-#    qCheapestDictItem = db.cursor()
-#    qDiscardDictItem = db.cursor()
-#    qNewDictItem = db.cursor()
-#    qAddDictValue = db.cursor()
-#    qParentPrefix = db.cursor()
-#
-#    def add_new_item(prefix, suggestion, value):
-#            qNewDictItem.execute("INSERT INTO dict_t (prefix, suggestion, value) VALUES (:prefix, :suggestion, :value)",
-#                                 {"prefix": prefix, "suggestion": " ".join(suggestion), "value": value})
-#            dict_stats["total_value"] = dict_stats["total_value"] + value
-#            dict_stats["size"] += 1
-#
-#    def add_dict_value(prefix, value):
-#            qAddDictValue.execute("UPDATE dict_t SET value = value + :plusvalue WHERE prefix=:prefix",
-#                                  {"prefix": prefix, "plusvalue": value})
-#            dict_stats["total_value"] = dict_stats["total_value"] + value
-#
-#    def find_parent_for(prefix):
-#        parent_suggestion = global_suggestion
-#        parent_prefix = None
-#        for start in range(1, len(prefix)):
-#            parent_prefix = " ".join(prefix_words[start:])
-#            qParentPrefix.execute("SELECT suggestion FROM dict_t WHERE prefix=:prefix", {"prefix": parent_prefix})
-#            if qParentPrefix.rowcount > 0:
-#                parent_suggestion = qParentPrefix.fetchone()[0].split(" ")
-#                break
-#        return (parent_prefix, parent_suggestion)
-#
-#    # iterate through all prefixes
-#    qGetFollowers = db.cursor()
-#    qPrefixes = db.cursor()
-#    qPrefixes.execute("SELECT prefix, SUM(occurences) FROM ngram_t GROUP BY prefix")
-#    total_lines = 0
-#    while True:
-#        ngram = qPrefixes.fetchone()
-#        if ngram is None:
-#            break
-#        prefix = ngram[0]
-#        prefix_words = prefix.split(" ")
-#        occurences = ngram[1]
-#
-#        # construct a suggestion list for this prefix
-#        qGetFollowers.execute("SELECT follower FROM ngram_t WHERE prefix=:prefix ORDER BY occurences DESC LIMIT :nsug",
-#                           {"prefix": prefix, "nsug": N_sug})
-#        suggestion = map(lambda x: x[0], qGetFollowers.fetchall())
-#
-#        # find the suggestion list for the parent of this prefix, that is, for A-B-C it is
-#        # either of B-C, or of C, or if none exists in the dictionary, then the global one
-#        (parent_prefix, parent_suggestion) = find_parent_for(prefix)
-#
-#        # calculate the value as occurences times distance from the parent suggestion
-#        value = occurences * DL_distance(suggestion, parent_suggestion)
-#
-#        # update the dictionary
-#        if dict_stats["size"] < N_max:
-#            # if the dictionary is not full, then just insert this prefix and suggestion
-#            add_new_item(prefix, suggestion, value)
-#        else:
-#            # the dictionary is full, find the least valuable entry
-#            qCheapestDictItem.execute("SELECT prefix, value FROM dict_t ORDER BY value LIMIT 1")
-#            cheapest = qCheapestDictItem.fetchone()
-#            cheapest_prefix = cheapest[0]
-#            cheapest_value = cheapest[1]
-#            if value < cheapest_value:
-#                # this suggestion is not worth storing (its parents suggestion list will be offered instead)
-#                if parent_prefix is not None:
-#                    # however, this makes its parent more valuable
-#                    add_dict_value(parent_prefix, value)
-#            else:
-#                # this suggestion is worth storing, the cheapest will be discarded
-#                add_new_item(prefix, suggestion, value)
-#                # but it makes the parent of the cheapest one more valuable
-#                (parent_prefix, parent_suggestion) = find_parent_for(cheapest_prefix)
-#                if parent_prefix is not None:
-#                    add_dict_value(parent_prefix, cheapest_value)
-#                # discard the cheapest one
-#                qDiscardDictItem.execute("DELETE FROM dict_t WHERE prefix=:prefix", {"prefix": cheapest_prefix})
-#                dict_stats["total_value"] = dict_stats["total_value"] - cheapest_value
-#                dict_stats["size"] = dict_stats["size"] - 1
-#
-#        total_lines += 1
-#        if need_progress_printout():
-#            log.debug("Dict update; lines='{l}', size='{s}', value='{v}'".format(l=total_lines, s=dict_stats["size"], v=dict_stats["total_value"]))
-#    log.info("Dict update; lines='{l}', size='{s}', value='{v}'".format(l=total_lines, s=dict_stats["size"], v=dict_stats["total_value"]))
-#
-#    qPrefixes.close()
-#    qGetFollowers.close()
-#    qParentPrefix.close()
-#    qAddDictValue.close()
-#    qNewDictItem.close()
-#    qDiscardDictItem.close()
-#    qCheapestDictItem.close()
-#    # db.commit()
-
 
 
 ##############################################################################
@@ -790,9 +660,9 @@ def train_input(dict_db_filename, basename):
     normalised_sentences_filename = "{b}.normalised.sentences".format(b=basename)
 
     (db, already_exists) = open_dict_db(dict_db_filename)
-    split_train_test(corpus_filename, train_filename, test_filename, train_ratio)
-    words = normalise_sentences(db, train_filename, normalised_sentences_filename)
-    collect_bayes_factors(db, normalised_sentences_filename, words)
+    #split_train_test(corpus_filename, train_filename, test_filename, train_ratio)
+    #normalise_sentences(db, train_filename, normalised_sentences_filename)
+    #collect_bayes_factors(db, normalised_sentences_filename)
     collect_ngrams(db, normalised_sentences_filename, N_max_prefix_size)
     calculate_ngram_factors(db)
     db.commit()
@@ -902,80 +772,6 @@ def get_suggestions(db, words, sentence):
 
     return suggestions
 
-##############################################################################
-# The testing process
-#
-
-def test_suggestions(dict_db_filename, basename, result_csv_name):
-    ''' The whole training process from original input to dictionary db '''
-    test_filename = "{b}.test.txt".format(b=basename)
-    normalised_sentences_filename = "test.normalised.sentences"
-
-    log.info("Testing suggestions; basename='{b}', result='{r}'".format(b=basename, r=result_csv_name))
-    # open the dict database
-    (db, _) = open_dict_db(dict_db_filename)
-    q = db.cursor()
-    q.execute("PRAGMA query_only = ON")
-    q.close()
-
-    global qGetFollowers, qGetBayes, N, total_words, sdrow
-    qGetFollowers = db.cursor()
-    qGetBayes = db.cursor()
-    # NOTE: In normal operation we would normalise the typed sentence
-    # and get suggestions at its end
-    # Now for testing we normalise the test sentenes, and get suggestions
-    # for all their word boundaries.
-
-    # normalise the test file
-    words = normalise_sentences(db, test_filename, normalised_sentences_filename, False)
-    N = len(words)
-    total_words = sum(w["occurences"] for w in words)
-    sdrow = dict((words[i]["word"], i + 1) for i in range(N))
-
-    # initialise the hit counters
-    hit = [0 for i in range(N_sug)]
-    miss = 0
-    total_hit = 0
-
-    infile = codecs.open(normalised_sentences_filename, mode="r", encoding="utf-8")
-    total_lines = 0
-    log.info("Checking suggestions;")
-    for sentence in infile:
-        sentence_words = sentence.split(" ")
-
-        for w in range(2, len(sentence_words) - 1):
-            real_word = sentence_words[w]
-            if real_word == "," or real_word == "_":
-                continue
-
-            log.info("Checking sentence: s='{s}', expected='{e}'".format(s=" ".join(sentence_words[:w]), e=real_word))
-            suggestions = get_suggestions(db, words, sentence_words[:w])
-            if suggestions is None:
-                suggestions = []
-
-            miss += 1  # book as missed by default
-            for i in range(len(suggestions)):
-                if real_word == suggestions[i]:
-                    miss -= 1
-                    hit[i] += 1
-                    total_hit += 1
-
-        total_lines += 1
-        if need_progress_printout():
-            log.debug("  Checked; lines='{l}', hit='{h}', miss='{m}'".format(l=total_lines, h=total_hit, m=miss))
-
-    log.info("  Checked; lines='{l}', hit='{h}', miss='{m}'".format(l=total_lines, h=total_hit, m=miss))
-    infile.close()
-    db.close()
-
-    # write the output file
-    outfile = codecs.open(result_csv_name, mode="w", encoding="utf-8")
-    outfile.write("\"tries\", \"occurences\"\n")
-    outfile.write("\"0\", \"{c}\"\n".format(c=miss))
-    for i in range(0, len(hit)):
-        outfile.write("\"{idx}\", \"{c}\"\n".format(idx=1 + i, c=hit[i]))
-    outfile.close()
-
 
 ##############################################################################
 # MAIN
@@ -985,7 +781,5 @@ def test_suggestions(dict_db_filename, basename, result_csv_name):
 train_input("/mnt/dict.db", "final/en_US/all")
 #train_input("dict.db", "final/{l}/{l}.{s}".format(l="en_US", s="news"))
 #train_input("dict.db", "final/{l}/{l}.{s}".format(l="en_US", s="twitter"))
-
-#test_suggestions("dict.db", "sample", "yadda.csv")
 
 # vim: set et ts=4 sw=4:
