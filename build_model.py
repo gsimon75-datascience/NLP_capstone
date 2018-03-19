@@ -11,7 +11,10 @@ import cPickle
 import sys
 import psutil
 from psutil import _psutil_linux as pslin
+from multiprocessing import Process
 import gc
+import bisect
+import math
 
 ##############################################################################
 # Parameters
@@ -24,7 +27,7 @@ N_sug = 4
 N_max = 2000000
 
 # Maximal prefix N-gram size
-N_max_prefix_size = 3
+N_max_prefix_size = 4
 
 # 90% training, 10% testing
 train_ratio = 1.0
@@ -34,9 +37,11 @@ train_ratio = 1.0
 #
 
 log = logging.getLogger("Main")
-formatter = logging.Formatter('%(asctime)s.%(msecs).03d - %(name)s - %(levelname)8s - %(message)s', datefmt='%H:%M:%S')
+#formatter = logging.Formatter('%(asctime)s.%(msecs).03d - %(name)s - %(levelname)8s - %(message)s', datefmt='%H:%M:%S')
+formatter = logging.Formatter('%(asctime)s - %(levelname)8s - %(message)s', datefmt='%H:%M:%S')
+#formatter = logging.Formatter('%(levelname)8s - %(message)s', datefmt='%H:%M:%S')
 
-file_handler = logging.FileHandler("build.log", mode="w", encoding="UTF8")
+file_handler = logging.FileHandler("build2.log", mode="w", encoding="UTF8")
 file_handler.setFormatter(formatter)
 log.addHandler(file_handler)
 
@@ -53,10 +58,6 @@ else:
 ##############################################################################
 # Parts of the training process
 #
-
-# retain some memory. don't know how much, from how much total, and what for
-# all mem-related stats have at least three different interpretations
-min_free_mb = 1024
 
 # Normalisation regexes for whole lines - may produce line breaks
 line_rules = [
@@ -203,16 +204,16 @@ def sql_progress():
     progress_counter += progress_delta
     log.debug("SQL progress; steps='{n}M'".format(n=progress_counter))
 
-free_mb = 0
+def free_mb():
+    return psutil.virtual_memory().available >> 20
+
+# retain some memory, about 1 GB
 def near_oom():
-    global free_mb
-    free_mb = psutil.virtual_memory().available >> 20
-    return free_mb <= min_free_mb
+    return free_mb() <= 1024
 
 
 def dump_memstat():
     log.debug("psutil.virtual_memory() = {x}".format(x=psutil.virtual_memory()))
-    log.debug("pslin.linux_sysinfo() = {x}".format(x=pslin.linux_sysinfo()))
 
 
 def open_dict_db(db_filename):
@@ -235,36 +236,28 @@ def open_dict_db(db_filename):
         CREATE TABLE word_t (
             id         INTEGER NOT NULL PRIMARY KEY,
             word       TEXT NOT NULL,
-            occurences      INTEGER NOT NULL DEFAULT 0)''')
+            occurences INTEGER NOT NULL DEFAULT 0)''')
         q.execute("CREATE INDEX word_word_i ON word_t (word)")
 
         q.execute('''
         CREATE TABLE bayes_t (
             condition   INTEGER NOT NULL,
             conditional INTEGER NOT NULL,
-            occurences       INTEGER NOT NULL DEFAULT 0,
+            occurences  INTEGER NOT NULL DEFAULT 0,
             factor      REAL,
             PRIMARY KEY (condition, conditional))''')
         # condition, conditional REFERENCES word_t
 
         q.execute('''
-        CREATE TABLE prefix_t (
-            id          INTEGER NOT NULL PRIMARY KEY,
+        CREATE TABLE ngram_t (
+            id          INTEGER NOT NULL,
             parent      INTEGER NOT NULL,
             word        INTEGER NOT NULL,
-            occurences       INTEGER NOT NULL DEFAULT 0)''')
-        q.execute("CREATE INDEX prefix_parent_i ON prefix_t (parent)")
-        # parent REFERENCES prefix_t, word REFERENCES word_t
-
-        q.execute('''
-        CREATE TABLE ngram_t (
-            prefix     INTEGER NOT NULL,
-            follower   INTEGER NOT NULL,
-            occurences      INTEGER NOT NULL DEFAULT 0,
-            factor     REAL,
-            PRIMARY KEY (prefix, follower))''')
-        q.execute("CREATE INDEX ngram_follower_i ON ngram_t (follower)")
-        # prefix REFERENCES prefix_t, follower REFERENCES word_t
+            occurences  INTEGER NOT NULL DEFAULT 0,
+            factor      REAL,
+            PRIMARY KEY (parent, word))''')
+        q.execute("CREATE INDEX ngram_id_i ON ngram_t (id)")
+        q.execute("CREATE INDEX ngram_word_i ON ngram_t (word)")
 
     q.close()
     db.commit()
@@ -285,12 +278,12 @@ class CounterUpdater:
                     table=tablename,
                     occurences=count_colname,
                     n=1+self.num_keys,
-                    condition=" AND ".join([ "{k}=?{n}".format(k=key_colnames[i], n=1+i) for i in range(self.num_keys) ]))
+                    condition=" AND ".join([ "{k}=?{n}".format(k=key_colnames[i], n=1+i) for i in xrange(self.num_keys) ]))
         self.sqlNewEntry = "INSERT INTO {table} ({keys}, {occurences}) VALUES ({placeholders}, ?{n})".format(
                     table=tablename,
                     keys=", ".join(key_colnames),
                     occurences=count_colname,
-                    placeholders=", ".join([ "?{n}".format(n=1+i) for i in range(self.num_keys) ]),
+                    placeholders=", ".join([ "?{n}".format(n=1+i) for i in xrange(self.num_keys) ]),
                     n=1+self.num_keys)
 
     def execute(self, params):
@@ -358,7 +351,7 @@ class CounterUpdater:
                 gc.collect()
                 self.db.commit()
                 while near_oom():
-                    log.error("Still near OOM; free_mb='{f}'".format(f=free_mb))
+                    log.error("Still near OOM; free_mb='{f}'".format(f=free_mb()))
                     dump_memstat()
                     gc.collect()
                     self.db.commit()
@@ -514,11 +507,11 @@ def collect_bayes_factors(db, input_filename):
         while True:
             w = cPickle.load(infile)
             nw = len(w)
-            for i in range(nw - 1):
+            for i in xrange(nw - 1):
                 iidx = w[i]
                 if iidx <= 1:
                     continue  # skip ^ and ,
-                for j in range(i + 1, nw):
+                for j in xrange(i + 1, nw):
                     jidx = w[j]
                     if jidx <= 1:
                         continue  # skip ^ and ,
@@ -562,76 +555,86 @@ def collect_bayes_factors(db, input_filename):
     db.commit()
 
 
-def collect_ngrams(db, input_filename, n):
+def collect_ngrams(db, input_filename):
     ''' Collect the n-grams from the given corpus '''
-    global free_mb
     log.info("Collecting ngrams; infile='{i}'".format(i=input_filename))
     infile = open(input_filename, "rb")
 
-    # NOTE: small caches, we'll need the ram for the prefixes
-    qFollowerCounter = CounterUpdater(0x1000000, db, "word_t", "occurences", "id")
-    qNgramCounter = CounterUpdater(0x1000000, db, "ngram_t", "occurences", "prefix", "follower")
-    
-    # NOTE: when recording a prefix, the following steps are needed:
-    # 1. if it exists, its occurence count must be increased
-    # 2. if not, then a new entry must be created
-    # 1+2. in both cases we need its id, because it'll be used as parent for the extended prefixes
-    # this latter requirement makes normal caching impossible - either each step must
-    # be committed alone, or everything must be cached
+    # NOTE: In fact we are collecting the (n+1)-grams, which then will be
+    # treated as a word following an n-gram, but that splitting will happen
+    # only later, now they are just (n+1)-grams.
 
-    # `prefixes` is the cache of prefix_t in a tree representation:
-    # { word: [id, occurence_count, {children}], ... }
-    prefixes = {}
-    next_prefix_id = 1
+    # ngrams = [id, count, [child-words], [child-nodes]]
+    ngrams = [-1, -1, [], []]
+    last_ngram_id = 0
     total_lines = 0
+    total_ngrams = 0
+
+    def dump(root, indent="  "):
+        if root[0] == -1:
+            log.debug("{i}word=-1, count=0".format(i=indent))
+
+        for i in xrange(len(root[2])):
+            ch = root[3][i]
+            log.debug("{i}  word={w}, count={c}".format(i=indent, w=root[2][i], c=ch[1]))
+            dump(ch, indent + "  ")
+
     try:
         while True:
             w = cPickle.load(infile)
             nw = len(w)
-            for f in range(1, nw):
-                follower = w[f]
-                qFollowerCounter.increment(1, follower)
-                pmax = min(n, f - 1)
-                p = prefixes
-                for i in range(1, pmax + 1):
-                    word = w[f - i]
-                    if not word in p:
-                        p[word] = [ next_prefix_id, 1 ]
-                        next_prefix_id += 1
+            #log.debug("Sequence; nw={nw}, w={w}".format(nw=nw, w=w))
+            w.reverse()
+            for start in xrange(0, nw):
+                nmax = min(N_max_prefix_size, nw - start)
+                #log.debug("Loop of start; start={s}, nmax={n}".format(s=start, n=nmax))
+                root = ngrams
+                for word in w[start : start + nmax]:
+                    idx = bisect.bisect_left(root[2], word)
+                    #log.debug("Adding {x} to: (idx={i}, n={n})".format(x=word, i=idx, n=len(root[2])))
+                    #dump(ngrams)
+                    if idx != len(root[2]) and root[2][idx] == word:
+                        root = root[3][idx]
+                        root[1] += 1
                     else:
-                        p[word][1] += 1
-                    qNgramCounter.increment(1, p[word][0], follower)
-                    if i < pmax:
-                        if len(p[word]) < 3:
-                            p[word].append({})
-                        p = p[word][2]
+                        last_ngram_id += 1
+                        newroot = [last_ngram_id, 1, [], []]
+                        root[2].insert(idx, word)
+                        root[3].insert(idx, newroot)
+                        root = newroot
+
+                    #log.debug("Result:")
+                    #dump(ngrams)
+
+                total_ngrams += nmax + 1
 
             total_lines += 1
+
             if need_progress_printout():
-                log.debug("  N-gram gen; lines='{l}', prefixes='{p}', mem='{m}'".format(l=total_lines, p=next_prefix_id, m=pslin.linux_sysinfo()))
+                log.debug("  N-gram gen; lines='{l}', ngrams='{n}', mem='{m}'".format(l=total_lines, n=total_ngrams, m=free_mb()))
     except EOFError:
         pass
-    log.info("  N-gram gen; lines='{l}', prefixes='{p}'".format(l=total_lines, p=next_prefix_id))
     infile.close()
-    qFollowerCounter.close()
-    qNgramCounter.close()
 
-    # commit `prefixes` to the db
-    qCommitPrefixes = db.cursor()
+    log.warning("Committing N-grams to DB;")
+    #dump(ngrams)
+        
+    qCommitNgrams = db.cursor()
     total_lines = [0]
-    def commit_prefixes(parent_id, p):
-        for word, rec in p.iteritems():
-            qCommitPrefixes.execute("INSERT INTO prefix_t (id, parent, word, occurences) VALUES (?1, ?2, ?3, ?4)", (rec[0], parent_id, word, rec[1]))
+    def commit_children_of(parent):
+        for i in xrange(0, len(parent[2])):
+            chword = parent[2][i]
+            ch = parent[3][i]
+            qCommitNgrams.execute("INSERT INTO ngram_t (id, parent, word, occurences) VALUES (?1, ?2, ?3, ?4)", (ch[0], parent[0], chword, ch[1]))
             total_lines[0] += 1
             if need_progress_printout():
-                log.debug("  Prefix commit; done='{t}', total='{n}'".format(t=total_lines[0], n=next_prefix_id))
-            if len(rec) >= 3:
-                commit_prefixes(rec[0], rec[2])
-                rec[2] = None
+                log.debug("  Prefix commit; done='{t}', total='{n}'".format(t=total_lines[0], n=last_ngram_id))
+            commit_children_of(ch)
+        del parent[:]
 
-    log.info("Committing prefixes; n='{n}'".format(n=next_prefix_id))
-    commit_prefixes(0, prefixes)
-    qCommitPrefixes.close()
+    log.info("Committing prefixes; n='{n}'".format(n=last_ngram_id))
+    commit_children_of(ngrams)
+    qCommitNgrams.close()
     db.commit()
 
 def calculate_ngram_factors(db):
@@ -663,10 +666,19 @@ def train_input(dict_db_filename, basename):
     #split_train_test(corpus_filename, train_filename, test_filename, train_ratio)
     #normalise_sentences(db, train_filename, normalised_sentences_filename)
     #collect_bayes_factors(db, normalised_sentences_filename)
-    collect_ngrams(db, normalised_sentences_filename, N_max_prefix_size)
-    calculate_ngram_factors(db)
+    collect_ngrams(db, normalised_sentences_filename)
+    #calculate_ngram_factors(db)
     db.commit()
     db.close()
+
+# NOTE: http://effbot.org/pyfaq/why-doesnt-python-release-the-memory-when-i-delete-a-large-object.htm
+#
+# "... "For speed", Python maintains an internal free list for integer objects. Unfortunately, that
+#  free list is both immortal and unbounded in size. floats also use an immortal & unbounded free list..."
+#
+# So there is no way to get rid of integers and free up space for others, excep
+# for running in a subprocess. Well, at least we could make it parallel if it
+# wasn't the RAM that is the bottleneck.
 
 
 ##############################################################################
@@ -700,7 +712,7 @@ def get_suggestions(db, words, sentence):
     ''' Get the suggestion list for a normalised sentence '''
     if type(sentence) == str: sentence = sentence.split(" ")
 
-    frow = [ 1 for i in range(N + 1) ]
+    frow = [ 1 for i in xrange(N + 1) ]
     for word in sentence:
         if not word in sdrow:
             continue
@@ -714,7 +726,7 @@ def get_suggestions(db, words, sentence):
                 frow[i] = float("infinity")
 
     suggestions = []
-    for i in range(0, len(sentence)):
+    for i in xrange(0, len(sentence)):
         prefix = sentence[i:]
 
         ngram_results = get_followers_ML(prefix)
@@ -749,7 +761,7 @@ def get_suggestions(db, words, sentence):
     # if too few suggestions, top up from the Bayesian results
     #if len(suggestions) < N_sug:
     if False:
-        bayes_guess = [ (frow[i] * words[i - 1]["occurences"] / total_words, i) for i in range(1, N + 1) ]
+        bayes_guess = [ (frow[i] * words[i - 1]["occurences"] / total_words, i) for i in xrange(1, N + 1) ]
         bayes_guess.sort(reverse=True)
         i = 0
         while len(suggestions) < N_sug:

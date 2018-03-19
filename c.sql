@@ -38,9 +38,7 @@ CREATE TABLE prefix_stat_t (
 	prefix_occurences integer NOT NULL);
 INSERT INTO prefix_stat_t SELECT prefix, SUM(occurences) AS prefix_occurences FROM ngram_t GROUP BY prefix;
 
--- INSERT OR REPLACE INTO ngram_t (prefix, follower, occurences, factor)
--- 	SELECT prefix, follower, occurences, ((total / prefix_occurences) - 1) / ((follower_occurences / occurences) - 1) AS factor
--- 	FROM ngram_t NATURAL JOIN follower_stat_t NATURAL JOIN prefix_stat_t;
+--------------------------------------------------------------------------------
 
 INSERT OR REPLACE INTO ngram_t (prefix, follower, occurences, factor)
 	SELECT prefix, follower, occurences, ((180228054 / prefix_occurences) - 1) / ((follower_occurences / occurences) - 1) AS factor
@@ -52,3 +50,14 @@ INSERT OR REPLACE INTO ngram_t (prefix, follower, occurences, factor)
 	SELECT prefix, follower, occurences, ((180228054 / pfx.occurences) - 1) / ((flw.occurences / occurences) - 1) AS factor
 	FROM ngram_t n INNER JOIN word_t flw ON n.follower = flw.id INNER JOIN prefix_t pfx ON n.prefix = pfx.id;
 UPDATE ngram_t SET factor=1.79e308 WHERE factor IS NULL;
+
+--------------------------------------------------------------------------------
+
+UPDATE word_t SET occurences=(SELECT SUM(occurences) FROM ngram_t WHERE word=word_t.id);
+
+total = 
+SELECT SUM(occurences) FROM ngram_t;
+
+total = 400143820
+
+UPDATE ngram_t SET factor = ((400143820.0 / (SELECT occurences FROM ngram_t parent WHERE parent.id = ngram_t.parent)) - 1) / ((1.0 * (SELECT occurences FROM word_t WHERE id = ngram_t.word) / occurences) - 1);
