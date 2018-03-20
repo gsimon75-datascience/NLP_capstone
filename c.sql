@@ -53,11 +53,23 @@ UPDATE ngram_t SET factor=1.79e308 WHERE factor IS NULL;
 
 --------------------------------------------------------------------------------
 
-UPDATE word_t SET occurences=(SELECT SUM(occurences) FROM ngram_t WHERE word=word_t.id);
+ALTER TABLE ngram_t RENAME TO prefix_t;
 
-total = 
-SELECT SUM(occurences) FROM ngram_t;
+UPDATE word_t SET occurences=(SELECT occurences FROM prefix_t WHERE word=word_t.id AND parent=-1);
 
-total = 400143820
+--total = SELECT SUM(occurences) FROM ngram_t;
+--total = 400143820
+--UPDATE ngram_t SET factor = ((400143820.0 / (SELECT occurences FROM ngram_t parent WHERE parent.id = ngram_t.parent)) - 1) / ((1.0 * (SELECT occurences FROM word_t WHERE id = ngram_t.word) / occurences) - 1);
 
-UPDATE ngram_t SET factor = ((400143820.0 / (SELECT occurences FROM ngram_t parent WHERE parent.id = ngram_t.parent)) - 1) / ((1.0 * (SELECT occurences FROM word_t WHERE id = ngram_t.word) / occurences) - 1);
+
+CREATE TABLE ngram_t (
+	prefix		INTEGER NOT NULL,
+	follower	INTEGER NOT NULL,
+	occurences	INTEGER NOT NULL,
+	factor		REAL,
+	PRIMARY KEY (prefix, follower)
+);
+
+
+
+
