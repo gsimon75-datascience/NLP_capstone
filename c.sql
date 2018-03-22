@@ -1,8 +1,9 @@
 PRAGMA synchronous = OFF;
-PRAGMA journal_mode = OFF;
 PRAGMA secure_delete = OFF;
 PRAGMA locking_mode = EXCLUSIVE;
 PRAGMA mmap_size = 4294967296;
+PRAGMA cache_size=20000;
+-- PRAGMA journal_mode = OFF;
 
 CREATE TABLE ngram_t (
 	prefix     TEXT NOT NULL,
@@ -70,6 +71,11 @@ CREATE TABLE ngram_t (
 	PRIMARY KEY (prefix, follower)
 );
 
+--total = SELECT SUM(occurences) FROM word_t;
+--total = 112955444
 
+UPDATE bayes_t SET factor = (112955444.0 / (SELECT occurences FROM word_t WHERE id = bayes_t.conditional) - 1) / (1.0 * (SELECT occurences FROM word_t WHERE id=bayes_t.condition) / occurences - 1);
 
+UPDATE ngram_t SET factor = (112955444.0 / (SELECT occurences FROM word_t WHERE id=ngram_t.follower) - 1) / (1.0 * (SELECT occurences FROM prefix_t WHERE id = ngram_t.prefix) / occurences - 1);
 
+DELETE FROM bayes_t WHERE occurences < 2;

@@ -10,18 +10,18 @@ import sqlite3
 import cPickle
 import sys
 import psutil
-from psutil import _psutil_linux as pslin
-from multiprocessing import Process
+import itertools
 import gc
 import bisect
 import math
+from cStringIO import StringIO
 
 ##############################################################################
 # Parameters
 #
 
 # Number of suggestions
-N_sug = 4
+N_sug = 5
 
 # Maximal size of the suggestion dictionary
 N_max = 2000000
@@ -38,8 +38,8 @@ train_ratio = 1.0
 
 log = logging.getLogger("Main")
 #formatter = logging.Formatter('%(asctime)s.%(msecs).03d - %(name)s - %(levelname)8s - %(message)s', datefmt='%H:%M:%S')
-formatter = logging.Formatter('%(asctime)s - %(levelname)8s - %(message)s', datefmt='%H:%M:%S')
-#formatter = logging.Formatter('%(levelname)8s - %(message)s', datefmt='%H:%M:%S')
+#formatter = logging.Formatter('%(asctime)s - %(levelname)8s - %(message)s', datefmt='%H:%M:%S')
+formatter = logging.Formatter('%(levelname)8s - %(message)s', datefmt='%H:%M:%S')
 
 file_handler = logging.FileHandler("build2.log", mode="w", encoding="UTF8")
 file_handler.setFormatter(formatter)
@@ -52,7 +52,7 @@ log.addHandler(stderr_handler)
 if "NLP_DEBUG" in os.environ:
     log.setLevel(int(os.environ["NLP_DEBUG"]))
 else:
-    log.setLevel(logging.INFO)
+    log.setLevel(logging.DEBUG)
 
 
 ##############################################################################
@@ -93,16 +93,14 @@ line_rules = [
 sentence_rules = [
     # pre-compiled regex                                    replacement
     # (NOTE: must be here at front, others rely on its result)
-    # more than one dashes are delimiter
-    [re.compile("-{2,}"),                                   " "],
     # quotes, parentheses, underscores to space
-    [re.compile("[()\":/_]"),                               " "],
-    # zap non-alnums in front of words
-    [re.compile(" [^a-zA-Z0-9,]+"),                         " "],
-    # zap non-alnums at the end of words
-    [re.compile("[^a-zA-Z0-9,]+ "),                         " "],
+    [re.compile("[][{}<>()\"\\|~`:*/%_#$,;+0-9-]"),         " "],
+    # zap non-alpha in front of words
+    [re.compile(" [^a-zA-Z]+"),                             " "],
+    # zap non-alpha at the end of words
+    [re.compile("[^a-zA-Z]+ "),                             " "],
     # remove those without at least a letter
-    [re.compile(" [^a-zA-Z,]+ "),                           " "],
+    [re.compile(" [^a-zA-Z]+ "),                            " "],
     # some common typos (NOTE: standalone only)
     [re.compile(" aint ", re.I),                            " ain't "],
     [re.compile(" cant ", re.I),                            " can't "],
@@ -164,7 +162,7 @@ sentence_rules = [
     [re.compile(" i'"),                                     " I'"],
     # some abbreviations (NOTE: standalone only)
     [re.compile(" c'mon ", re.I),                           " come on "],
-    [re.compile(" c[ou]z ", re.I),                          " because "],
+    [re.compile(" (be?)?c[ou]z ", re.I),                    " because "],
     [re.compile(" imma ", re.I),                            " I'm a "],
     [re.compile(" ofcoz ", re.I),                           " of course "],
     [re.compile(" pl[sz] ", re.I),                          " please "],
@@ -172,17 +170,14 @@ sentence_rules = [
     [re.compile(" tho ", re.I),                             " though "],
     [re.compile(" u ", re.I),                               " you "],
     [re.compile(" ur ", re.I),                              " your "],
-    [re.compile(" 2b ", re.I),                              " to be "],
     [re.compile(" o' ", re.I),                              " of "],
     [re.compile(" ol' ", re.I),                             " old "],
     # not-in-word apostrophes to space
     [re.compile(" '|' "),                                   " "],
     # zap all single characters except 'I' and 'a'
-    [re.compile(" [^IAa,] "),                               " "],
-    # zap all words with invalid characters (valid: alnum, ', _, +, -)
-    #[re.compile(" [^ ]*[^, a-zA-Z0-9_'+-][^ ]* "),          " _ "],
-    # coalesce adjacent subsentence delimiters
-    [re.compile("(,\\s*)+"),                                " , "],
+    [re.compile(" [^IAa] "),                               " "],
+    # zap all words with invalid characters (valid: alnum, ', _)
+    #[re.compile(" [^ ]*[^, a-zA-Z0-9_'][^ ]* "),          " _ "],
     # coalesce whitespaces
     [re.compile("\\s+"),                                    " "]
 ]
@@ -249,15 +244,21 @@ def open_dict_db(db_filename):
         # condition, conditional REFERENCES word_t
 
         q.execute('''
-        CREATE TABLE ngram_t (
+        CREATE TABLE prefix_t (
             id          INTEGER NOT NULL,
             parent      INTEGER NOT NULL,
             word        INTEGER NOT NULL,
             occurences  INTEGER NOT NULL DEFAULT 0,
-            factor      REAL,
             PRIMARY KEY (parent, word))''')
-        q.execute("CREATE INDEX ngram_id_i ON ngram_t (id)")
-        q.execute("CREATE INDEX ngram_word_i ON ngram_t (word)")
+        q.execute("CREATE INDEX prefix_id_i ON prefix_t (id)")
+
+        q.execute('''
+        CREATE TABLE ngram_t (
+            prefix      INTEGER NOT NULL,
+            follower    INTEGER NOT NULL,
+            occurences  INTEGER NOT NULL DEFAULT 0,
+            factor      REAL,
+            PRIMARY KEY (prefix, follower))''')
 
     q.close()
     db.commit()
@@ -394,15 +395,19 @@ def split_train_test(input_filename, train_filename, test_filename, train_ratio)
 def split_to_sentences(line):
     '''Normalises a line and returns a list of its sentences (at least one)'''
     for rule in line_rules:
-        line = rule[0].sub(rule[1], line.rstrip("\n"))
+        line = rule[0].sub(rule[1])
+        #line = rule[0].sub(rule[1], line.rstrip("\n")) # FIXME: delete
 
     result = []
     for sentence in line.split("\n"):
+        sentence = sentence.strip()
+        if not sentence:
+            continue
         for rule in sentence_rules:
             sentence = rule[0].sub(rule[1], sentence)
         sentence = sentence.strip()
         if sentence:
-            result.append(u"^ {s}".format(s=sentence))
+            result.append(sentence)
 
     return result
 
@@ -427,8 +432,7 @@ def normalise_sentences(db, input_filename, output_filename, collect_words=True)
     infile = codecs.open(input_filename, mode="r", encoding="utf-8")
     outfile = codecs.open(temp_filename, mode="w", encoding="utf-8")
     total_lines = 0
-    wordset = set(["^", ","])
-    i = 2
+    wordset = set()
     for line in infile:
         for sentence in split_to_sentences(line):
             outfile.write(sentence + "\n")
@@ -444,7 +448,7 @@ def normalise_sentences(db, input_filename, output_filename, collect_words=True)
     outfile.close()
     infile.close()
 
-    words = [ (0, "^"), (1, ",") ] if collect_words else get_wordset(db)
+    words = [] if collect_words else get_wordset(db)
     if collect_words:
         # coalesce the words that differ only in capitalisation: less caps letters wins
         wordset = map(lambda w: (w.lower(), w), wordset)
@@ -457,14 +461,13 @@ def normalise_sentences(db, input_filename, output_filename, collect_words=True)
                 n -= 1
             else:
                 i += 1
-        wordset = map(lambda w: w[1], wordset)
 
-        indexed = set(["^", ","])
-        i = 2
-        for word in wordset:
-            if not word in indexed:
-                indexed.add(word)
-                words.append((i, word))
+        indexed = set()
+        i = 0
+        for w in wordset:
+            if not w[1] in indexed:
+                indexed.add(w[1])
+                words.append((i, w[1]))
                 i += 1
 
         # store the global words in the dict database
@@ -505,21 +508,15 @@ def collect_bayes_factors(db, input_filename):
     total_lines = 0
     try:
         while True:
-            w = cPickle.load(infile)
+            w = list(set(cPickle.load(infile)))
             nw = len(w)
             for i in xrange(nw - 1):
                 iidx = w[i]
-                if iidx <= 1:
-                    continue  # skip ^ and ,
                 for j in xrange(i + 1, nw):
                     jidx = w[j]
-                    if jidx <= 1:
-                        continue  # skip ^ and ,
                     qBayesCounter.increment(1, iidx, jidx)
-                    total += 1
-                    if iidx != jidx:
-                        qBayesCounter.increment(1, jidx, iidx)
-                        total += 1
+                    qBayesCounter.increment(1, jidx, iidx)
+                    total += 2
 
             total_lines += 1
             if need_progress_printout():
@@ -530,28 +527,6 @@ def collect_bayes_factors(db, input_filename):
     infile.close()
     qBayesCounter.close()
 
-    # convert count(AB) terms to Bayes factor P(B|A) / P(B|#A)
-    qBayesFactors = db.cursor();
-    q = db.cursor()
-    q.execute("SELECT condition, SUM(occurences) FROM bayes_t GROUP BY condition")
-    word_counts = dict((int(x[0]), float(x[1])) for x in q.fetchall())
-    total = float(sum(word_counts.values()))
-    N = len(word_counts)
-    for i, ci in word_counts.iteritems():
-        if need_progress_printout():
-            log.debug("  Bayes; row='{i}', of='{n}'".format(i=i, n=N))
-        total_ci_m1 = (total / ci) - 1
-        q.execute("SELECT conditional, occurences FROM bayes_t WHERE condition=?1", (i,))
-        for rec in q.fetchall():
-            j = rec[0]
-            occurences = rec[1]
-            cj = word_counts[j]
-            if cj != occurences:
-                qBayesFactors.execute("UPDATE bayes_t SET factor=?3 WHERE condition=?1 AND conditional=?2", (i, j, total_ci_m1 / ((cj / occurences) - 1)))
-            # NOTE: NULL means Inf, will read as None
-
-    qBayesFactors.close()
-    q.close()
     db.commit()
 
 
@@ -564,9 +539,15 @@ def collect_ngrams(db, input_filename):
     # treated as a word following an n-gram, but that splitting will happen
     # only later, now they are just (n+1)-grams.
 
-    # ngrams = [id, count, [child-words], [child-nodes]]
-    ngrams = [-1, -1, [], []]
-    last_ngram_id = 0
+    # prefixes = [id, count, [child-words], [child-nodes]]
+    prefixes = [-1, -1, [], []]
+    last_prefix_id = 0
+
+    # ngrams is not a tree, but a list - one list for each column
+    ngram_prefix = []
+    ngram_follower = []
+    ngram_occurences = []
+
     total_lines = 0
     total_ngrams = 0
 
@@ -585,69 +566,108 @@ def collect_ngrams(db, input_filename):
             nw = len(w)
             #log.debug("Sequence; nw={nw}, w={w}".format(nw=nw, w=w))
             w.reverse()
-            for start in xrange(0, nw):
+            for start in xrange(0, nw - 1):
                 nmax = min(N_max_prefix_size, nw - start)
                 #log.debug("Loop of start; start={s}, nmax={n}".format(s=start, n=nmax))
-                root = ngrams
-                for word in w[start : start + nmax]:
+                root = prefixes
+                for i in xrange(start, start + nmax - 1):
+                    word = w[i]
                     idx = bisect.bisect_left(root[2], word)
                     #log.debug("Adding {x} to: (idx={i}, n={n})".format(x=word, i=idx, n=len(root[2])))
-                    #dump(ngrams)
+                    #dump(prefixes)
                     if idx != len(root[2]) and root[2][idx] == word:
                         root = root[3][idx]
                         root[1] += 1
                     else:
-                        last_ngram_id += 1
-                        newroot = [last_ngram_id, 1, [], []]
+                        last_prefix_id += 1
+                        newroot = [last_prefix_id, 1, [], []]
                         root[2].insert(idx, word)
                         root[3].insert(idx, newroot)
                         root = newroot
 
+                    prefix_id = root[0]
+                    follower = w[i + 1]
+                    idx1 = bisect.bisect_left(ngram_prefix, prefix_id)
+                    if idx1 == len(ngram_prefix) or ngram_prefix[idx1] != prefix_id:
+                        ngram_prefix.insert(idx1, prefix_id)
+                        ngram_follower.insert(idx1, follower)
+                        ngram_occurences.insert(idx1, 1)
+                    else:
+                        idx2 = bisect.bisect_right(ngram_prefix, prefix_id, idx1)
+
+                        idx = bisect.bisect_left(ngram_follower, follower, idx1, idx2)
+                        if idx == idx2 or ngram_follower[idx] != follower:
+                            ngram_prefix.insert(idx, prefix_id)
+                            ngram_follower.insert(idx, follower)
+                            ngram_occurences.insert(idx, 1)
+                        else:
+                            ngram_occurences[idx] += 1
+
                     #log.debug("Result:")
-                    #dump(ngrams)
+                    #dump(prefixes)
 
                 total_ngrams += nmax + 1
 
             total_lines += 1
 
             if need_progress_printout():
-                log.debug("  N-gram gen; lines='{l}', ngrams='{n}', mem='{m}'".format(l=total_lines, n=total_ngrams, m=free_mb()))
+                log.debug("  N-gram gen; lines='{l}', prefixes='{n}', mem='{m}'".format(l=total_lines, n=total_ngrams, m=free_mb()))
     except EOFError:
         pass
     infile.close()
 
     log.warning("Committing N-grams to DB;")
-    #dump(ngrams)
+    #dump(prefixes)
         
-    qCommitNgrams = db.cursor()
+    qCommitPrefixes = db.cursor()
     total_lines = [0]
     def commit_children_of(parent):
         for i in xrange(0, len(parent[2])):
             chword = parent[2][i]
             ch = parent[3][i]
-            qCommitNgrams.execute("INSERT INTO ngram_t (id, parent, word, occurences) VALUES (?1, ?2, ?3, ?4)", (ch[0], parent[0], chword, ch[1]))
+            qCommitPrefixes.execute("INSERT INTO prefix_t (id, parent, word, occurences) VALUES (?1, ?2, ?3, ?4)", (ch[0], parent[0], chword, ch[1]))
             total_lines[0] += 1
             if need_progress_printout():
-                log.debug("  Prefix commit; done='{t}', total='{n}'".format(t=total_lines[0], n=last_ngram_id))
+                log.debug("  Prefix commit; done='{t}', total='{n}'".format(t=total_lines[0], n=last_prefix_id))
             commit_children_of(ch)
         del parent[:]
 
-    log.info("Committing prefixes; n='{n}'".format(n=last_ngram_id))
-    commit_children_of(ngrams)
-    qCommitNgrams.close()
+    log.info("Committing prefixes; n='{n}'".format(n=last_prefix_id))
+    commit_children_of(prefixes)
+    qCommitPrefixes.close()
+
+    q = db.cursor()
+    total_lines = 0
+    n = len(ngram_prefix)
+    for i in xrange(0, n):
+        q.execute("INSERT INTO ngram_t (prefix, follower, occurences) VALUES (?1, ?2, ?3)", (ngram_prefix[i], ngram_follower[i], ngram_occurences[i]))
+        total_lines += 1
+        if need_progress_printout():
+            log.debug("  N-gram commit; done='{t}', total='{n}'".format(t=total_lines, n=n))
+    q.close()
+
     db.commit()
 
 def calculate_ngram_factors(db):
     ''' Calculate Bayes factors for ngrams '''
-    log.info("Calculating N-gram Bayes factors;")
     q = db.cursor()
-    q.execute("SELECT SUM(occurences) FROM prefix_t")
+    q.execute("SELECT SUM(occurences) FROM word_t")
     total = q.fetchone()[0]
-    q.execute('''
-    INSERT OR REPLACE INTO ngram_t (prefix, follower, occurences, factor)
-        SELECT n.prefix, n.follower, n.occurences, ((?1 / pfx.occurences) - 1) / ((flw.occurences / n.occurences) - 1) AS factor
-        FROM ngram_t n INNER JOIN word_t flw ON n.follower = flw.id INNER JOIN prefix_t pfx ON n.prefix = pfx.id''', (total,) )
-    log.debug("Calculated N-gram Bayes factors; total='{t}', rows='{r}'".format(t=total, r=q.rowcount))
+    log.debug("Total words; n={n}".format(n=total))
+
+    log.info("Removing single Bayes pairs;")
+    q.execute("DELETE FROM bayes_t WHERE occurences < 2")
+
+    log.info("Calculating Bayes factors;")
+    q.execute("UPDATE bayes_t SET factor = (1.0 * ?1 / (SELECT occurences FROM word_t WHERE id = bayes_t.conditional) - 1) / (1.0 * (SELECT occurences FROM word_t WHERE id=bayes_t.condition) / occurences - 1)", (total, ))
+    log.debug("Calculated Bayes factors; rows='{r}'".format(r=q.rowcount))
+
+    log.info("Calculating N-gram factors;")
+    q.execute("UPDATE ngram_t SET factor = (1.0 * ?1 / (SELECT occurences FROM word_t WHERE id=ngram_t.follower) - 1) / (1.0 * (SELECT occurences FROM prefix_t WHERE id = ngram_t.prefix) / occurences - 1)", (total, ))
+    log.debug("Calculated N-gram factors; rows='{r}'".format(r=q.rowcount))
+
+    #q.execute("DROP INDEX prefix_id_i")
+
     db.commit()
 
 
@@ -663,10 +683,10 @@ def train_input(dict_db_filename, basename):
     normalised_sentences_filename = "{b}.normalised.sentences".format(b=basename)
 
     (db, already_exists) = open_dict_db(dict_db_filename)
-    #split_train_test(corpus_filename, train_filename, test_filename, train_ratio)
-    #normalise_sentences(db, train_filename, normalised_sentences_filename)
+    split_train_test(corpus_filename, train_filename, test_filename, train_ratio)
+    normalise_sentences(db, train_filename, normalised_sentences_filename)
     #collect_bayes_factors(db, normalised_sentences_filename)
-    collect_ngrams(db, normalised_sentences_filename)
+    #collect_ngrams(db, normalised_sentences_filename)
     #calculate_ngram_factors(db)
     db.commit()
     db.close()
@@ -676,122 +696,214 @@ def train_input(dict_db_filename, basename):
 # "... "For speed", Python maintains an internal free list for integer objects. Unfortunately, that
 #  free list is both immortal and unbounded in size. floats also use an immortal & unbounded free list..."
 #
-# So there is no way to get rid of integers and free up space for others, excep
+# So there is no way to get rid of integers and free up space for others, except
 # for running in a subprocess. Well, at least we could make it parallel if it
 # wasn't the RAM that is the bottleneck.
+
+
+##############################################################################
+# MAIN - Training the model
+#
+
+#train_input("test.db", "sample")
+train_input("dict.db", "final/en_US/all")
+#train_input("dict.db", "final/{l}/{l}.{s}".format(l="en_US", s="news"))
+#train_input("dict.db", "final/{l}/{l}.{s}".format(l="en_US", s="twitter"))
 
 
 ##############################################################################
 # Using the model
 #
 
-qGetFollowers = None
-qGetBayes = None
-def get_followers_ML(u):
-    ''' Maximum-Likelihood algorithm '''
-    n = len(u)
-    #log.debug("Check prefix; p='{p}'".format(p=" ".join(u)))
-    qGetFollowers.execute("SELECT follower, occurences FROM ngram_t WHERE prefix=:prefix", {"prefix": " ".join(u)})
-    wset = dict(map(lambda x: (x[0], int(x[1])), qGetFollowers.fetchall()))
-    cu = 0
-    t = 0
-    for k, cuw in wset.iteritems():
-        t += 1
-        cu += cuw
-
-    p = {}
-    for w, cuw in wset.iteritems():
-        p[w] = float(cuw) / cu
-    return p
-
-
-N = None
-total_words = 0
+num_words = None
+words = None
 sdrow = None
-def get_suggestions(db, words, sentence):
-    ''' Get the suggestion list for a normalised sentence '''
-    if type(sentence) == str: sentence = sentence.split(" ")
+word_odds = None  # fallback guesses based on word frequencies only
+words_sorted = None
+qGetBayes = None
+qGetPrefix = None
+qGetNgram = None
 
-    frow = [ 1 for i in xrange(N + 1) ]
-    for word in sentence:
-        if not word in sdrow:
-            continue
-        j = sdrow[word]
-        qGetBayes.execute("SELECT conditional, factor FROM bayes_t WHERE condition=:j", {"j": j})
+def get_suggestions(db, prefix_words, partial=""):
+    ''' Get the suggestion list for a normalised sentence '''
+    global num_words, words, sdrow, word_odds, words_sorted
+    global qGetBayes, qGetPrefix, qGetNgram
+
+    # get the Bayesian relatives factors
+    bayes_factors = {}
+    # first chain the 'odds-factor of `i` occuring, provided that `w` occured'
+    for w in prefix_words:
+        #log.debug("Searching Bayesian relatives for; word='{w}'".format(w=words[w]))
+        qGetBayes.execute("SELECT conditional, factor, occurences FROM bayes_t WHERE condition=?1", (w, ))
         for row in qGetBayes.fetchall():
             i = int(row[0])
-            if row[1] is not None:
-                frow[i] *= float(row[1])
+            if (not i in words) or (i in prefix_words):
+                continue
+            # combine the factors by chaining (multiplying) them
+            if row[1] is None:
+                # NOTE: this means that word `i` occurs *only* in such sentences that also contain word `w`
+                #bayes_factors[i] = float("infinity")
+                pass
+            elif not i in bayes_factors:
+                bayes_factors[i] = float(row[1])
             else:
-                frow[i] = float("infinity")
+                bayes_factors[i] *= float(row[1])
+    # now fix it up with the base 'odds of `i` occuring'
+    for i in bayes_factors.keys():
+        bayes_factors[i] *= word_odds[i]
 
-    suggestions = []
-    for i in xrange(0, len(sentence)):
-        prefix = sentence[i:]
 
-        ngram_results = get_followers_ML(prefix)
-        if not ngram_results:
+    # dump the top-N Bayesian relative to the log
+    result = [ (k, v) for k,v in bayes_factors.iteritems() ]
+    result.sort(key=lambda x: -x[1])
+    for i in xrange(0, min(10, len(result))):
+        log.debug("    Bayesian relative; id='{i}', word='{w}', factor='{f}'".format(i=result[i][0], w=words[result[i][0]].encode("utf-8"), f=result[i][1]))
+
+    # find the longest prefix that matches the end of prefix_words
+    prefix_id = -1
+    prefix_occurences = 0
+    for j in xrange(len(prefix_words) - 1, -1, -1):
+        w = prefix_words[j]
+        qGetPrefix.execute("SELECT id, occurences FROM prefix_t WHERE parent=?1 AND word=?2", (prefix_id, w))
+        result = qGetPrefix.fetchone()
+        if not result:
+            log.debug("Prefix; id={i}, prefix='{p}', occurences='{n}'".format(i=prefix_id, p=" ".join(map(lambda x: words[x], prefix_words[j+1:])), n=prefix_occurences))
+            break
+        prefix_id = int(result[0])
+        prefix_occurences = int(result[1])
+
+
+    # get the n-grams that start with that prefix
+    ngrams = {}
+    qGetNgram.execute("SELECT follower, factor, occurences FROM ngram_t WHERE prefix=?1", (prefix_id, ))
+    result = qGetNgram.fetchall()
+    for row in result:
+        i = int(row[0])
+        if not i in words:
+            log.error("Unknown ngram follower; i={i}".format(i=i))
             continue
+        if not words[i].startswith(partial):
+            continue
+        occurences = int(row[2])
+        f = float(row[1]) if row[1] is not None else 1e100
+        #log.debug("N-gram candidate; id='{i}', word='{w}', ngram_factor='{f}', occurences='{n}'".format(i=i, w=words[i].encode("utf-8"), f=f, n=occurences))
+        ngrams[i] = { "factor": f, "occurences": occurences, "m": occurences*f/(1+f) }
 
-        log.info("  Prefix: {p}".format(p=" ".join(prefix)))
-        suggestions = []
-        for k, v in ngram_results.iteritems():
-            p = v
-            if k in sdrow:
-                odds = frow[sdrow[k]]
-                pbayes = odds / (1 + odds)
-                #log.debug("Combining result; word='{w}', p_ngram='{pn}', p_bayes='{pb}'".format(w=k, pn=v, pb=pbayes))
-                p *= pbayes
-            suggestions.append((p, k))
+    # combine the Bayesian factors into the ngram-based ones
+    for i in ngrams.keys():
+        occurences = ngrams[i]["occurences"]
+        f = ngrams[i]["factor"]
+        bf = 1
+        if i in bayes_factors:
+            bf = bayes_factors[i]
+            f *= bf
+            del bayes_factors[i]
+        ngrams[i]["m"] = occurences * f / (1 + f)
 
-        suggestions.sort(reverse=True)
-        #return suggestions
-        i = 0
-        for x in suggestions:
-            if x[0] == 0:
-                break
-            if i == N_sug:
-                log.debug("  -----;")
-            i += 1
-            log.debug(u"  Guess; w='{w}', p='{p}'".format(w=x[1], p=x[0]))
+    # listify the ngram-based results, because we want them sorted by odds
+    #result = [ (i, ngrams[i]["m"]) for i in ngrams.keys() if not math.isinf(ngrams[i]["m"]) and not math.isnan(ngrams[i]["m"]) ]
+    result = [ (i, ngrams[i]["m"]) for i in ngrams.keys() if not math.isnan(ngrams[i]["m"]) ]
+    result.sort(key=lambda x: -x[1])
 
-        suggestions = map(lambda x: x[1], suggestions[:N_sug])
-        break
+    # log the top-10
+    for r in result[:10]:
+        i = r[0]
+        log.debug("N-gram result; id='{i}', word='{w}', ngram_factor='{f}', m='{m}'".format(
+            i=i,
+            w=words[i].encode("utf-8"),
+            f=ngrams[i]["factor"],
+            m=ngrams[i]["m"]))
 
-    # if too few suggestions, top up from the Bayesian results
-    #if len(suggestions) < N_sug:
-    if False:
-        bayes_guess = [ (frow[i] * words[i - 1]["occurences"] / total_words, i) for i in xrange(1, N + 1) ]
-        bayes_guess.sort(reverse=True)
-        i = 0
-        while len(suggestions) < N_sug:
-            if bayes_guess[i][0] == 0:
-                break
-            x = words[bayes_guess[i][1]]["word"]
-            if not x in suggestions:
-                log.debug(u"  Bayes guess; w='{w}'".format(w=x))
-                suggestions.append(x)
-            i += 1
+    # if there are not enough suggestions, top up from the remaining Bayesian factors
+    # NOTE: there is no 'occurences of condition' here, so sorting by odds factor instead
+    if len(result) < N_sug:
+        # listify the Bayesian results, because we want them sorted by odds
+        if partial == "":
+            bayes_factors = [ (i, f) for i, f in bayes_factors.iteritems() ]
+        else:
+            bayes_factors = [ (i, f) for i, f in bayes_factors.iteritems() if word[i].startswith(partial) ]
+        bayes_factors.sort(key=lambda x: -x[1])
+        result.extend(bayes_factors[: N_sug - len(result)])
 
     # if still too few suggestions, top up from the global words
-    i = 0
-    while len(suggestions) < N_sug:
-        x = words[i]["word"]
-        if not x in suggestions:
-            log.debug(u"  Global guess; w='{w}'".format(w=x))
-            suggestions.append(x)
-        i += 1
+    # NOTE: there is no 'occurences of condition' here, so sorting by raw occurence counter
+    for w in words_sorted:
+        if len(result) >= N_sug:
+            break;
+        if not w[0].startswith(partial):
+            continue
+        result.append(w)
 
-    return suggestions
+    return result[:N_sug]
 
 
-##############################################################################
-# MAIN
-#
+def test_input(db, f):
+    global num_words, words, sdrow, word_odds, words_sorted
+    global qGetBayes, qGetPrefix, qGetNgram
 
-#train_input("test.db", "sample")
-train_input("/mnt/dict.db", "final/en_US/all")
-#train_input("dict.db", "final/{l}/{l}.{s}".format(l="en_US", s="news"))
-#train_input("dict.db", "final/{l}/{l}.{s}".format(l="en_US", s="twitter"))
+    qGetBayes = db.cursor()
+    qGetPrefix = db.cursor()
+    qGetNgram = db.cursor()
+
+    q = db.cursor() 
+    q.execute("SELECT id, word, occurences FROM word_t")
+    word_odds = q.fetchall()  # [ (id1, word1, occurences1), (id2, word2, occurences2), ... ]
+    q.close()
+    word_odds = filter(lambda x: x[1] != "^" and x[1] != ",", word_odds) # FIXME: remove
+    num_words = len(word_odds)
+    words = dict((w[0], w[1]) for w in word_odds)  # { id1: word1, id2: word2, ... }
+    sdrow = dict((w[1].lower(), w[0]) for w in word_odds)  # { word1: id1, word2: id2, ... }
+    words_sorted = [ (w[1], w[2]) for w in word_odds ]
+    words_sorted.sort(key=lambda x: -x[1])
+    total_words = sum(w[2] for w in word_odds)
+    word_odds = dict((w[0], float(w[2]) / (total_words - w[2])) for w in word_odds)
+
+    while True:
+        line = f.readline()
+        if not line:
+            break
+
+        sentence = " ".join(split_to_sentences(line))
+        if not sentence:
+            continue
+        log.debug("Sentence; normalised='{s}'".format(s=sentence))
+
+        sentence_words = map(lambda w: sdrow[w], filter(lambda w: w in sdrow, sentence.lower().split(" ")))
+
+        suggestions = get_suggestions(db, sentence_words, partial="")
+        i = 0
+        for s in suggestions:
+            log.debug("Suggestion; i='{i}', word='{w}', m='{m}'".format(i=i, w=words[s[0]], m=s[1]))
+            i += 1
+
+    qGetBayes.close()
+    qGetPrefix.close()
+    qGetNgram.close()
+
+
+       
+
+tests = StringIO("""
+The guy in front of me just bought a pound of bacon , a bouquet , and a case of
+You're the reason why I smile everyday. Can you follow me please? It would mean the
+Hey sunshine , can you follow me and make me the
+Very early observations on the Bills game Offense still struggling but the
+Go on a romantic date at the
+Well I'm pretty sure my granny has some old bagpipes in her garage I'll dust them off and be on my
+Ohhhhh PointBreak is on tomorrow
+Love that film and haven't seen it in quite some
+After the ice bucket challenge Louis will push his long wet hair out of his eyes with his little
+Be grateful for the good times and keep the faith during the
+If this isn't the cutest thing you've ever seen, then you must be""")
+
+#tests = StringIO("""
+#Love that film and haven't seen it in quite some
+#After the ice bucket challenge Louis will push his long wet hair out of his eyes with his little
+#Be grateful for the good times and keep the faith during the
+#If this isn't the cutest thing you've ever seen, then you must be""")
+
+#(db, already_exists) = open_dict_db("/mnt/dict.db")
+#db.execute("PRAGMA query_only = ON")
+#test_input(db, tests)
 
 # vim: set et ts=4 sw=4:
