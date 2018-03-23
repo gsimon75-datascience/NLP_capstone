@@ -614,14 +614,14 @@ def collect_ngrams(db, input_filename):
                         ngram_occurences.insert(idx1, 1)
                     else:
                         idx2 = bisect.bisect_right(ngram_prefix, prefix_id, idx1)
-
                         idx = bisect.bisect_left(ngram_follower, follower, idx1, idx2)
                         if idx == idx2 or ngram_follower[idx] != follower:
-                            ngram_prefix.insert(idx, prefix_id)
-                            ngram_follower.insert(idx, follower)
-                            ngram_occurences.insert(idx, 1)
-                        else:
-                            ngram_occurences[idx] += 1
+#                            ngram_prefix.insert(idx, prefix_id)
+#                            ngram_follower.insert(idx, follower)
+#                            ngram_occurences.insert(idx, 1)
+#                        else:
+#                            ngram_occurences[idx] += 1
+                            pass
 
                     #log.debug("Result:")
                     #dump(prefixes)
@@ -635,6 +635,8 @@ def collect_ngrams(db, input_filename):
     except EOFError:
         pass
     infile.close()
+
+    return
 
     log.warning("Committing N-grams to DB;")
     #dump(prefixes)

@@ -19,4 +19,11 @@ clean:
 
 upload:		$(TARGETS)
 		echo 'library(markdown); result <- rpubsUpload("$(SUMMARY}", "$<", "$(ID)"); print(result);' | R --no-save 
-		
+	
+
+
+CC=g++
+CPPFLAGS=-Wall -std=c++11 -O3
+LDFLAGS=-lsqlite3
+
+find_ngrams:	find_ngrams.cc 
