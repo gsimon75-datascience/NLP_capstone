@@ -38,10 +38,10 @@ train_ratio = 1.0
 
 log = logging.getLogger("Main")
 #formatter = logging.Formatter('%(asctime)s.%(msecs).03d - %(name)s - %(levelname)8s - %(message)s', datefmt='%H:%M:%S')
-#formatter = logging.Formatter('%(asctime)s - %(levelname)8s - %(message)s', datefmt='%H:%M:%S')
-formatter = logging.Formatter('%(levelname)8s - %(message)s', datefmt='%H:%M:%S')
+formatter = logging.Formatter('%(asctime)s - %(levelname)8s - %(message)s', datefmt='%H:%M:%S')
+#formatter = logging.Formatter('%(levelname)8s - %(message)s', datefmt='%H:%M:%S')
 
-file_handler = logging.FileHandler("build2.log", mode="w", encoding="UTF8")
+file_handler = logging.FileHandler("build3.log", mode="w", encoding="UTF8")
 file_handler.setFormatter(formatter)
 log.addHandler(file_handler)
 
@@ -395,7 +395,7 @@ def split_train_test(input_filename, train_filename, test_filename, train_ratio)
 def split_to_sentences(line):
     '''Normalises a line and returns a list of its sentences (at least one)'''
     for rule in line_rules:
-        line = rule[0].sub(rule[1])
+        line = rule[0].sub(rule[1], line)
         #line = rule[0].sub(rule[1], line.rstrip("\n")) # FIXME: delete
 
     result = []
@@ -432,47 +432,55 @@ def normalise_sentences(db, input_filename, output_filename, collect_words=True)
     infile = codecs.open(input_filename, mode="r", encoding="utf-8")
     outfile = codecs.open(temp_filename, mode="w", encoding="utf-8")
     total_lines = 0
-    wordset = set()
+    total_words = 0
+    wordset = {}
     for line in infile:
         for sentence in split_to_sentences(line):
             outfile.write(sentence + "\n")
             if not collect_words:
                 continue
             for word in sentence.split(" "):
-                wordset.add(word)
+                if word in wordset:
+                    wordset[word] += 1
+                else:
+                    wordset[word] = 1
+                    total_words += 1
         total_lines += 1
         if need_progress_printout():
-            log.debug("  Collected; lines='{l}'".format(l=total_lines))
+            log.debug("  Collected; lines='{l}', words='{w}'".format(l=total_lines, w=total_words))
 
-    log.info("  Collected; lines='{l}'".format(l=total_lines))
+    log.info("  Collected; lines='{l}', words='{w}'".format(l=total_lines, w=total_words))
     outfile.close()
     infile.close()
 
     words = [] if collect_words else get_wordset(db)
     if collect_words:
         # coalesce the words that differ only in capitalisation: less caps letters wins
-        wordset = map(lambda w: (w.lower(), w), wordset)
+        wordset = map(lambda w: [w[0].lower(), w[0], w[1]], wordset.iteritems())
         wordset.sort()
         i = 0
         n = len(wordset) - 1
         while i < n:
             if wordset[i][0] == wordset[i + 1][0]:
+                wordset[i + 1][2] += wordset[i][2]
                 del wordset[i]
                 n -= 1
             else:
                 i += 1
+        log.info("Removed single words; remained='{n}'".format(n=n))
 
+        # assign an index to those words that occur more than once
         indexed = set()
         i = 0
         for w in wordset:
-            if not w[1] in indexed:
+            if (w[2] > 1) and not w[1] in indexed:
                 indexed.add(w[1])
-                words.append((i, w[1]))
+                words.append((i, w[1], w[2]))
                 i += 1
 
         # store the global words in the dict database
         q = db.cursor()
-        q.executemany("INSERT INTO word_t (id, word) VALUES (?1, ?2)", words)
+        q.executemany("INSERT INTO word_t (id, word, occurences) VALUES (?1, ?2, ?3)", words)
         q.close()
         db.commit()
 
@@ -527,6 +535,15 @@ def collect_bayes_factors(db, input_filename):
     infile.close()
     qBayesCounter.close()
 
+    q = db.cursor()
+    log.info("Removing single Bayes pairs;")
+    q.execute("DELETE FROM bayes_t WHERE occurences < 2")
+
+    log.info("Calculating Bayes factors;")
+    q.execute("UPDATE bayes_t SET factor = (1.0 * ?1 / (SELECT occurences FROM word_t WHERE id = bayes_t.conditional) - 1) / (1.0 * (SELECT occurences FROM word_t WHERE id=bayes_t.condition) / occurences - 1)", (total, ))
+    log.debug("Calculated Bayes factors; rows='{r}'".format(r=q.rowcount))
+
+    q.close()
     db.commit()
 
 
@@ -534,6 +551,9 @@ def collect_ngrams(db, input_filename):
     ''' Collect the n-grams from the given corpus '''
     log.info("Collecting ngrams; infile='{i}'".format(i=input_filename))
     infile = open(input_filename, "rb")
+
+    # ask the db to free up RAM
+    db.execute("PRAGMA shrink_memory")
 
     # NOTE: In fact we are collecting the (n+1)-grams, which then will be
     # treated as a word following an n-gram, but that splitting will happen
@@ -625,6 +645,8 @@ def collect_ngrams(db, input_filename):
         for i in xrange(0, len(parent[2])):
             chword = parent[2][i]
             ch = parent[3][i]
+            if ch[1] <= 1:  # don't store prefixes that occur only once
+                continue;
             qCommitPrefixes.execute("INSERT INTO prefix_t (id, parent, word, occurences) VALUES (?1, ?2, ?3, ?4)", (ch[0], parent[0], chword, ch[1]))
             total_lines[0] += 1
             if need_progress_printout():
@@ -640,6 +662,8 @@ def collect_ngrams(db, input_filename):
     total_lines = 0
     n = len(ngram_prefix)
     for i in xrange(0, n):
+        if ngram_occurences[i] <= 1:    # don't store ngrams that occur only once
+            continue
         q.execute("INSERT INTO ngram_t (prefix, follower, occurences) VALUES (?1, ?2, ?3)", (ngram_prefix[i], ngram_follower[i], ngram_occurences[i]))
         total_lines += 1
         if need_progress_printout():
@@ -654,13 +678,6 @@ def calculate_ngram_factors(db):
     q.execute("SELECT SUM(occurences) FROM word_t")
     total = q.fetchone()[0]
     log.debug("Total words; n={n}".format(n=total))
-
-    log.info("Removing single Bayes pairs;")
-    q.execute("DELETE FROM bayes_t WHERE occurences < 2")
-
-    log.info("Calculating Bayes factors;")
-    q.execute("UPDATE bayes_t SET factor = (1.0 * ?1 / (SELECT occurences FROM word_t WHERE id = bayes_t.conditional) - 1) / (1.0 * (SELECT occurences FROM word_t WHERE id=bayes_t.condition) / occurences - 1)", (total, ))
-    log.debug("Calculated Bayes factors; rows='{r}'".format(r=q.rowcount))
 
     log.info("Calculating N-gram factors;")
     q.execute("UPDATE ngram_t SET factor = (1.0 * ?1 / (SELECT occurences FROM word_t WHERE id=ngram_t.follower) - 1) / (1.0 * (SELECT occurences FROM prefix_t WHERE id = ngram_t.prefix) / occurences - 1)", (total, ))
@@ -686,7 +703,7 @@ def train_input(dict_db_filename, basename):
     split_train_test(corpus_filename, train_filename, test_filename, train_ratio)
     normalise_sentences(db, train_filename, normalised_sentences_filename)
     #collect_bayes_factors(db, normalised_sentences_filename)
-    #collect_ngrams(db, normalised_sentences_filename)
+    collect_ngrams(db, normalised_sentences_filename)
     #calculate_ngram_factors(db)
     db.commit()
     db.close()
