@@ -26,6 +26,8 @@
 // NOTE: size is on the scale of malloc chunk overhead, so
 // it makes little sense to allocate object and manage its ptr
 
+// NOTE: I've removed a lot of debugging code, if you need them, check this delta
+
 struct follower_t {
     int32_t word;
     int32_t occurences;
@@ -46,9 +48,6 @@ struct prefix_t {
     prefix_t *get_child(int32_t child_word, int32_t follower_word);
     void commit(int32_t parent_id) const;
     ~prefix_t();
-    //void dump(int indent) const;
-    //void dump_children() const;
-    //void dump_followers() const;
 };
 
 sqlite3 *db = nullptr;
@@ -92,38 +91,8 @@ prefix_t::~prefix_t() {
     free(children);
 }
 
-/*void prefix_t::dump_followers() const {
-    printf("(%d)[", num_followers);
-    for (int32_t i = 0; i < num_followers; i++) {
-        if (i)
-            printf(", ");
-        printf("(%d)%d", followers[i].occurences, followers[i].word);
-    }
-    printf("]");
-}*/
-
-/*void prefix_t::dump_children() const {
-    printf("(%d)[", num_children);
-    for (int32_t i = 0; i < num_children; i++) {
-        if (i)
-            printf(", ");
-        printf("%d", children[i].word);
-    }
-    printf("]");
-}*/
-
-/*void prefix_t::dump(int indent) const {
-    for (int i = 0; i < indent; i++)
-        printf("  ");
-    printf("word=%d, n=%d, followers=", word, occurences); dump_followers(); printf("\n");
-    for (int32_t i = 0; i < num_children; i++)
-        children[i].dump(indent + 1);
-}*/
-
-
 void
 prefix_t::book_follower(int32_t follower_word) {
-    //printf("  Searching for follower %d in ", follower_word); dump_followers();
     // find where it should be
     int32_t min = 0, max = num_followers, middle = 0;
     while (min < max) {
@@ -133,27 +102,22 @@ prefix_t::book_follower(int32_t follower_word) {
         else if (followers[middle].word > follower_word)
             max = middle;
         else {
-            //printf(": FOUND at %d\n", middle);
             followers[middle].occurences++;
             return;
         }
     }
     total_ngrams++;
-    //printf(": CREATING NEW at %d\n", min);
-    //printf("    Followers before insertion: "); dump_followers(); printf("\n");
     // min = max = the position where it should be
     followers = (follower_t*)realloc(followers, (1 + num_followers) * sizeof(follower_t));
     if (num_followers > min)
         memmove(&followers[min + 1], &followers[min], (num_followers - min) * sizeof(follower_t));
     num_followers++;
     new(&followers[min]) follower_t(follower_word);
-    //printf("    Followers after  insertion: "); dump_followers(); printf("\n");
 }
 
 prefix_t* prefix_t::get_child(int32_t child_word, int32_t follower_word) {
     // find where it should be
     int32_t min = 0, max = num_children, middle = 0;
-    //printf("Searching for child %d of %d in ", child_word, word); dump_children();
     while (min < max) {
         middle = (min + max) / 2;
         if (children[middle].word < child_word)
@@ -161,20 +125,16 @@ prefix_t* prefix_t::get_child(int32_t child_word, int32_t follower_word) {
         else if (children[middle].word > child_word)
             max = middle;
         else {
-            //printf(": FOUND at %d\n", middle);
             return &children[middle];
         }
     }
     total_prefixes++;
-    //printf(": CREATING NEW at %d\n", min);
-    //printf("  Children before insertion: "); dump_children(); printf("\n");
     // min = max = the position where it should be
     children = (prefix_t*)realloc(children, (1 + num_children) * sizeof(prefix_t));
     if (num_children > min)
         memmove(&children[min + 1], &children[min], (num_children - min) * sizeof(prefix_t));
     num_children++;
     new(&children[min]) prefix_t(child_word);
-    //printf("  Children after  insertion: "); dump_children(); printf("\n");
     return &children[min];
 }
 
@@ -185,29 +145,17 @@ generate_ngrams(int32_t *input, int32_t *after_last) {
 
     total_lines = total_prefixes = total_ngrams = 0;
     for (int32_t *start = input; start < after_last; start = end + 1) {
-        //printf("-- Start of line\n");
         for (end = start; *end != END_SENTENCE; ++end)
             ;
         for (int32_t *follower = end - 1; (follower > start); --follower) {
             int32_t *pfx_start = follower - 1;
             prefix_t *p = &root;
             for (int i = 0; (i < N_max_prefix_size) && (pfx_start >= start); ++i, --pfx_start) {
-                /*printf("-- Adding prefix=[");
-                for (int32_t *pp = pfx_start; pp < follower; ++pp) {
-                    if (pp != pfx_start)
-                        printf(", ");
-                    printf("%d", *pp);
-                }
-                printf("], follower=%d\n", *follower);*/
-
                 p = p->get_child(*pfx_start, *follower);
                 p->occurences++;
                 p->book_follower(*follower);
-
-                //printf("-- Result:\n"); root.dump(0);
             }
         }
-        //printf("-- End of line\n");
         total_lines++;
 
         if (need_progress_printout())
