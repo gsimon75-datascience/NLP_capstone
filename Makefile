@@ -24,6 +24,6 @@ upload:		$(TARGETS)
 
 CC=g++
 CPPFLAGS=-Wall -std=c++11 -O3
-LDFLAGS=-lsqlite3
+LDLIBS=-lsqlite3
 
 find_ngrams:	find_ngrams.cc 
