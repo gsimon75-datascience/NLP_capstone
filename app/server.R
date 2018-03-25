@@ -13,47 +13,33 @@ N_sug <- 4
 
 # Read the list of known words
 words <- readRDS("word_t.rds")
-words$id <- as.character(words$id)
 # Calculate the unconditional odds for the words
 total_words <- sum(words$occurences)
 words <- words %>% mutate(odds=occurences/(total_words-occurences))
+if (any(words$id != 1:nrow(words))) stop("Words table IDs are not reordered")
 # Create lookup hashes
 word_to_id <- new.env(hash=T) # lookup from word to id
-id_to_word <- new.env(hash=T) # lookup from id to word
-word_odds <- new.env(hash=T)  # id to (unconditional) odds
-
-l_ply(1:nrow(words), function(x) {
-	i <- words$id[x]
-	w <- words$word[x]
-	id_to_word[[i]] <- w
-	word_to_id[[w]] <- i
-	word_odds[[i]] <- words$odds[x]
-})
+l_ply(1:nrow(words), function(x) { word_to_id[[words$word[x]]] <- x })
+words <- words %>% mutate(id=NULL)
 # Create a word list sorted in decreasing order of factors
 words_sorted <- words$odds
 names(words_sorted) <- words$word
 words_sorted <- attr(sort(words_sorted, decreasing=T), 'name')
 # > word_to_id[["beer"]]
-# [1] 21118
-# > id_to_word[[toString(21118)]]
+# [1] 70
+# > words$word[70]
 # [1] "beer"
-# > word_odds[[toString(21118)]]
-# [1] 0.0002863355
 # > words_sorted[1:5]
 # [1] "the" "to"  "and" "a"   "of" 
 
 ## Read the Bayesian relatives table
 bayes <- readRDS("bayes_t.rds") %>% filter(!is.na(factor))
-bayes$condition <- as.character(bayes$condition)
-bayes$conditional <- as.character(bayes$conditional)
 
 ## Read the N-gram prefixes table
 prefixes <- readRDS("prefix_t.rds")
-prefixes$word <- as.character(prefixes$word)
 
 ## Read the N-grams table
 ngrams <- readRDS("ngram_t.rds")
-ngrams$follower <- as.character(ngrams$follower)
 
 if (debug >= 5) print(paste0(Sys.time(), " Ready"))
 
@@ -161,10 +147,7 @@ shinyServer(
 			}
 
 			prefix_words <- strsplit(normalise_line(prefixline), "[[:space:]]+")[[1]]
-			prefix_ids <- unlist(lapply(prefix_words, function(w) {word_to_id[[w]]}), use.names=F)
-			# NOTE: The NULLs that were produced by unrecognised words are implicitely dropped
-
-			generate_prediction(prefix_ids, hint)
+			generate_prediction(prefix_words, hint)
 		})
 
 		# Normalise a line (canonicalise punctuation, remove invalid words, fix some typos, etc.)
@@ -278,37 +261,36 @@ shinyServer(
 
 
 		# Generate predictions for a given prefix and hint
-		generate_prediction <- function(prefix_ids, hint) {
-			if (debug >= 4) print(paste0(Sys.time(), " generate_prediction([", paste(prefix_ids, collapse=", "), "], '", hint, "')"))
+		generate_prediction <- function(prefix_words, hint) {
+			if (debug >= 4) print(paste0(Sys.time(), " generate_prediction([", paste(prefix_words, collapse=", "), "], '", hint, "')"))
+			prefix_ids <- unlist(lapply(prefix_words, function(w) {word_to_id[[w]]}), use.names=F)
+			# NOTE: The NULLs that were produced by unrecognised words are implicitely dropped
 
 			# Collect the word id-s that start with the hint
-			valid_word_ids <- new.env(hash=T)
-			vwid <- words %>% filter(startsWith(word, prefix=hint)) %>% select(id)
-			l_ply(as.character(vwid$id), function(x) { valid_word_ids[[x]] <- T })
+			word_is_valid <- startsWith(words$word, prefix=hint)
 
 			# First, iterate though the prefixes and collect what other words does the Bayes table suggest ('conditional'), provided that this particular prefix is present ('condition') in the sentence
 			if (debug >= 5) print(paste0(Sys.time(), " Searching Bayesian relative words;"))
-			bayes_factors <- new.env(hash=T)
+			bayes_factors <- vector()
 			for (pfx in prefix_ids) {
 				relatives <- bayes %>% filter(condition == pfx) %>% select(conditional, factor)
 				if (debug >= 5) print(paste0(Sys.time(), " Found Bayesian relatives; word=", pfx, ", num=", nrow(relatives)))
 
 				mapply(FUN=function(i, f) {
-					if (!is.null(valid_word_ids[[i]])) {
-						if (debug >= 6) print(paste0(Sys.time(), " relative; id=", i, ", factor=", f))
+					if (word_is_valid[i]) {
 						# Chain this factor to the already collected ones
-						bf <- bayes_factors[[i]]
-						if (is.null(bf)) {
+						bf <- bayes_factors[i]
+						if (is.na(bf)) {
 							# We start with the unconditional odds of that suggested word 'i'
-							#bayes_factors[[i]] <- word_odds[[i]] * f
-							bayes_factors[[i]] <- f
+							#bayes_factors[i] <<- words$odds[i] * f
+							bayes_factors[i] <<- f
 						} else {
 							# Chain the odds-multiplying factors to the previous ones
-							bayes_factors[[i]] <- bf * f
+							bayes_factors[i] <<- bf * f
 						}
+						if (debug >= 6) print(paste0(Sys.time(), " relative; id=", i, ", factor=", f, " cumulative=", bayes_factors[i]))
 					}
 				}, relatives$conditional, relatives$factor)
-
 			}
 
 			# Then find the longest known prefix that matches the end of what we got
@@ -327,7 +309,7 @@ shinyServer(
 
 			# Find the N-grams that start with the found prefix
 			if (debug >= 5) print(paste0(Sys.time(), " Searching for N-gram followers;"))
-			ngram_m <- list()
+			ngram_m <- vector()
 			followers <- ngrams[ngrams$prefix == prefix_id, c("follower", "occurences", "factor")]
 			num_followers <- nrow(followers)
 
@@ -341,39 +323,38 @@ shinyServer(
 					if (is.na(f))
 						f <- 1e100
 					# Skip unsuitable items
-					if (is.null(valid_word_ids[[i]]))
+					if (!word_is_valid[i])
 						next
 					# Combine the Bayesian factors into the ngram-based ones
-					bf <- bayes_factors[[i]]
-					if (!is.null(bf)) {
+					bf <- bayes_factors[i]
+					if (!is.na(bf)) {
 						f <- f * bf
-						rm(list=c(i), envir=bayes_factors) # remove to prevent double suggestions later # FIXME: doesn't expand 'i' !!!
+						bayes_factors[i] <- NA # remove to prevent double suggestions later
 					}
-
 					# Calculate an expected value (remember: f is an odds)
-					ngram_m[i] <- followers$occurences[idx] * f / (1 + f)
+					ngram_m[i] <- n * f / (1 + f)
 				}
 
 				# Sort the N-gram hints and 
 				if (length(ngram_m) > 0) {
-					ngram_hints <- sort(unlist(ngram_m), decreasing=T)
-					ngram_hints <- sapply(attr(ngram_hints, 'name'), function(x) { id_to_word[[x]] })
-					names(ngram_hints) <- NULL
+					names(ngram_m) <- 1:length(ngram_m)
+					ngram_hints <- words$word[as.numeric(attr(sort(ngram_m, decreasing=T), 'name'))]
 					result <- append(result, ngram_hints[1:min(more_needed, length(ngram_hints))])
 					more_needed <- N_sug - length(result)
 				}
 			}
+			if (debug >= 4) print(paste0(Sys.time(), " Partial result: [", paste0(result, collapse=", "), "]"))
 
 			# If there are too few results, top it up from the Bayesian relatives' list
 			if ((more_needed > 0) && (length(bayes_factors) > 0)) {
 				if (debug >= 5) print(paste0(Sys.time(), " Topping up with Bayesian relatives; needed=", more_needed))
 
-				bayes_hints <- sort(sapply(ls(bayes_factors), function(x) { bayes_factors[[x]] }), decreasing=T)
-				bayes_hints <- sapply(attr(bayes_hints, 'name'), function(x) { id_to_word[[x]] })
-				names(bayes_hints) <- NULL
+				names(bayes_factors) <- 1:length(bayes_factors)
+				bayes_hints <- words$word[as.numeric(attr(sort(bayes_factors, decreasing=T), 'name'))]
 				result <- append(result, bayes_hints[1:min(more_needed, length(bayes_hints))])
 				more_needed <- N_sug - length(result)
 			}
+			if (debug >= 4) print(paste0(Sys.time(), " Partial result: [", paste0(result, collapse=", "), "]"))
 
 			# If there are still too few results, top it up from the (unconditional) global word list
 			if (more_needed > 0) {
@@ -386,8 +367,8 @@ shinyServer(
 				}
 				more_needed <- N_sug - length(result)
 			}
-
 			if (debug >= 4) print(paste0(Sys.time(), " Result: [", paste0(result, collapse=", "), "]"))
+
 			result
 		}
 
