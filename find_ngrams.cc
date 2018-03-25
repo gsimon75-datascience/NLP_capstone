@@ -16,11 +16,11 @@
 // NOTE: run as `stdbuf -oL ./find_ngrams | tee find_ngrams.log`
 
 
-//#define INPUT_FILENAME "sample.normalised.sentences.bin"
-//#define DB_FILENAME "test.db"
+#define INPUT_FILENAME "sample.normalised.sentences.bin"
+#define DB_FILENAME "test.db"
 
-#define INPUT_FILENAME "final/en_US/all.normalised.sentences.bin"
-#define DB_FILENAME "dict.db"
+//#define INPUT_FILENAME "final/en_US/all.normalised.sentences.bin"
+//#define DB_FILENAME "dict.db"
 
 #define N_max_prefix_size  4
 
@@ -359,6 +359,7 @@ collect_bayes(int32_t *input, int32_t *after_last) {
 int
 main(void) {
     int res;
+    sqlite3_stmt *q = nullptr;
 
     int fd_in = open(INPUT_FILENAME, O_RDONLY);
     if (fd_in < 0) {
@@ -419,6 +420,20 @@ main(void) {
             return -2;
     }
 
+    // obtain the total word count
+    res = sqlite3_prepare_v2(db, "SELECT SUM(occurences) FROM word_t", -1, &q, NULL);
+    if (res != SQLITE_OK) {
+        fprintf(stderr, "Cannot obtain total word count: %d\n", res);
+            return -2;
+    }
+    res = sqlite3_step(q);
+    if (res != SQLITE_ROW) {
+        fprintf(stderr, "Cannot obtain total word count: %d\n", res);
+            return -2;
+    }
+    uint32_t total_words = sqlite3_column_int(q, 0);
+    sqlite3_finalize(q); q = nullptr;
+
     printf("%s Collecting Bayes relatives\n", strnow());
     bayes = new bayes_t();
     collect_bayes(input, after_last);
@@ -427,6 +442,22 @@ main(void) {
     bayes->commit();
     delete bayes;
     bayes = nullptr;
+
+    printf("%s Updating Bayes factors\n", strnow());
+    res = sqlite3_prepare_v2(db, "UPDATE bayes_t SET factor = "
+            "(1.0 * ?1 / (SELECT occurences FROM word_t WHERE id = bayes_t.conditional) - 1) / "
+            "(1.0 * (SELECT occurences FROM word_t WHERE id=bayes_t.condition) / occurences - 1)", -1, &q, NULL);
+    if (res != SQLITE_OK) {
+        fprintf(stderr, "Cannot prepare Bayes factor updater: %d\n", res);
+            return -2;
+    }
+    sqlite3_bind_int(q, 1, total_words);
+    res = sqlite3_step(q);
+    if (res != SQLITE_DONE) {
+        fprintf(stderr, "Cannot update Bayes factors: %d\n", res);
+            return -2;
+    }
+    sqlite3_finalize(q); q = nullptr;
 
     res = sqlite3_exec(db, "COMMIT;BEGIN", nullptr, nullptr, nullptr);
     if (res != SQLITE_OK) {
@@ -446,6 +477,22 @@ main(void) {
     root->commit(-1);
     delete root;
     root = nullptr;
+
+    printf("%s Updating N-gram factors\n", strnow());
+    res = sqlite3_prepare_v2(db, "UPDATE ngram_t SET factor = "
+            "(1.0 * ?1 / (SELECT occurences FROM word_t WHERE id=ngram_t.follower) - 1) / "
+            "(1.0 * (SELECT occurences FROM prefix_t WHERE id = ngram_t.prefix) / occurences - 1)", -1, &q, NULL);
+    if (res != SQLITE_OK) {
+        fprintf(stderr, "Cannot prepare N-gram factor updater: %d\n", res);
+            return -2;
+    }
+    sqlite3_bind_int(q, 1, total_words);
+    res = sqlite3_step(q);
+    if (res != SQLITE_DONE) {
+        fprintf(stderr, "Cannot update N-gram factors: %d\n", res);
+            return -2;
+    }
+    sqlite3_finalize(q); q = nullptr;
 
     res = sqlite3_exec(db, "COMMIT", nullptr, nullptr, nullptr);
     if (res != SQLITE_OK) {

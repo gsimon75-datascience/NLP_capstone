@@ -14,6 +14,7 @@ import itertools
 import gc
 import bisect
 import math
+import struct
 from cStringIO import StringIO
 
 ##############################################################################
@@ -21,7 +22,7 @@ from cStringIO import StringIO
 #
 
 # Number of suggestions
-N_sug = 5
+N_sug = 3
 
 # Maximal size of the suggestion dictionary
 N_max = 2000000
@@ -66,7 +67,7 @@ line_rules = [
     # revert unicode punctuation to ascii
     [re.compile(u"[\u2018-\u201b\u2032\u2035`]"),           "'"],
     [re.compile(u"[\u201c-\u201f\u2033\u2034\u2036\u2037\u2039\u203a\u2057\xab\xbb]"), "\""],
-    [re.compile(u"[\u2010-\u2015\u2043]"),                  "-"],
+    [re.compile(u"[\u2010-\u2015\u2043\xad]"),              "-"],
     [re.compile(u"[\u2024\u2027]"),                         "."],
     [re.compile(u"\u2025"),                                 ".."],
     [re.compile(u"\u2026"),                                 "..."],
@@ -76,25 +77,18 @@ line_rules = [
     [re.compile(u"[\u204e\u2055\u2062]"),                   "*"],
     [re.compile(u"\u2052"),                                 "%"],
     [re.compile(u"\u2064"),                                 "+"],
-    # sub-sentence separators to comma or newline with trailing-leading spaces
-    [re.compile("\\r"),                                     ""],
+    # no crlf, bom, lrm, rlm, etc.
+    [re.compile(u"[\r\ufeff\u200e\u200f\x80-\xbf\xd7\xf7]"),""],
+    # quotes, parentheses, underscores to space
+    [re.compile("[][@{}<>()\"\\|~`:*/%_#$,;+=^0-9-]"),      " "],
+    [re.compile("&\\S*"),                                   " "],
     [re.compile("^|$"),                                     " "],
-    [re.compile("(,\\s*)+"),                                " , "],
-    # coalesce adjacent subsentence delimiters
-    [re.compile("(,\\s*)+"),                                " , "],
-    # strip leading and trailing subsentence delimiters
-    [re.compile("(,\\s*)+$"),                               ""],
-    [re.compile("^(\\s*,)+"),                               ""],
-    # finally: split at sentence delimiters
-    [re.compile("[.!?]+"),                                  " \n "]
 ]
 
 # Normalisation regexes for sub-sentences
 sentence_rules = [
     # pre-compiled regex                                    replacement
     # (NOTE: must be here at front, others rely on its result)
-    # quotes, parentheses, underscores to space
-    [re.compile("[][{}<>()\"\\|~`:*/%_#$,;+0-9-]"),         " "],
     # zap non-alpha in front of words
     [re.compile(" [^a-zA-Z]+"),                             " "],
     # zap non-alpha at the end of words
@@ -172,12 +166,12 @@ sentence_rules = [
     [re.compile(" ur ", re.I),                              " your "],
     [re.compile(" o' ", re.I),                              " of "],
     [re.compile(" ol' ", re.I),                             " old "],
-    # not-in-word apostrophes to space
-    [re.compile(" '|' "),                                   " "],
     # zap all single characters except 'I' and 'a'
     [re.compile(" [^IAa] "),                               " "],
     # zap all words with invalid characters (valid: alnum, ', _)
     #[re.compile(" [^ ]*[^, a-zA-Z0-9_'][^ ]* "),          " _ "],
+    # everything where a letter repeats more than 2 times
+    [re.compile(" \S*(\S)\\1{3,}\S* ",re.I),                " "],
     # coalesce whitespaces
     [re.compile("\\s+"),                                    " "]
 ]
@@ -217,7 +211,7 @@ def open_dict_db(db_filename):
     already_exists = os.path.isfile(db_filename)
     db = sqlite3.connect(db_filename)  # , isolation_level=None)
     global progress_delta
-    db.set_progress_handler(sql_progress, progress_delta * 1000000)
+    #db.set_progress_handler(sql_progress, progress_delta * 1000000)
     q = db.cursor()
     q.execute("PRAGMA synchronous = OFF")
     #q.execute("PRAGMA journal_mode = OFF")
@@ -396,12 +390,10 @@ def split_to_sentences(line):
     '''Normalises a line and returns a list of its sentences (at least one)'''
     for rule in line_rules:
         line = rule[0].sub(rule[1], line)
-        #line = rule[0].sub(rule[1], line.rstrip("\n")) # FIXME: delete
 
     result = []
     for sentence in line.split("\n"):
-        sentence = sentence.strip()
-        if not sentence:
+        if not sentence.strip():
             continue
         for rule in sentence_rules:
             sentence = rule[0].sub(rule[1], sentence)
@@ -489,18 +481,22 @@ def normalise_sentences(db, input_filename, output_filename, collect_words=True)
 
     infile = codecs.open(temp_filename, mode="r", encoding="utf-8")
     outfile = open(output_filename, mode="wb")
+    binfile = open("{f}.bin".format(f=output_filename), mode="wb")
     total_lines = 0
     for sentence in infile:
         # split and replace the rare words with '_'
         sentence_words = map(lambda w: words[w], filter(lambda w: w in words, sentence.rstrip("\n").lower().split(" ")))
         if sentence_words:
             cPickle.dump(sentence_words, outfile, -1)
+        sentence_words.append(0xffffffff)
+        binfile.write(struct.pack("<{n}I".format(n=len(sentence_words)), *sentence_words))
 
         total_lines += 1
         if need_progress_printout():
             log.debug("  Normalised; lines='{l}'".format(l=total_lines))
 
     log.info("  Normalised; lines='{l}'".format(l=total_lines))
+    binfile.close()
     outfile.close()
     infile.close()
     os.unlink(temp_filename)
@@ -705,7 +701,7 @@ def train_input(dict_db_filename, basename):
     split_train_test(corpus_filename, train_filename, test_filename, train_ratio)
     normalise_sentences(db, train_filename, normalised_sentences_filename)
     #collect_bayes_factors(db, normalised_sentences_filename)
-    collect_ngrams(db, normalised_sentences_filename)
+    #collect_ngrams(db, normalised_sentences_filename)
     #calculate_ngram_factors(db)
     db.commit()
     db.close()
@@ -725,7 +721,7 @@ def train_input(dict_db_filename, basename):
 #
 
 #train_input("test.db", "sample")
-train_input("dict.db", "final/en_US/all")
+#train_input("dict.db", "final/en_US/all")
 #train_input("dict.db", "final/{l}/{l}.{s}".format(l="en_US", s="news"))
 #train_input("dict.db", "final/{l}/{l}.{s}".format(l="en_US", s="twitter"))
 
@@ -748,12 +744,14 @@ def get_suggestions(db, prefix_words, partial=""):
     global num_words, words, sdrow, word_odds, words_sorted
     global qGetBayes, qGetPrefix, qGetNgram
 
+    log.info(u"Searching; prefix='{p}', hint='{h}'".format(p=" ".join(map(lambda x: words[x], prefix_words)), h=partial))
+
     # get the Bayesian relatives factors
     bayes_factors = {}
     # first chain the 'odds-factor of `i` occuring, provided that `w` occured'
     for w in prefix_words:
         #log.debug("Searching Bayesian relatives for; word='{w}'".format(w=words[w]))
-        qGetBayes.execute("SELECT conditional, factor, occurences FROM bayes_t WHERE condition=?1", (w, ))
+        qGetBayes.execute("SELECT conditional, factor FROM bayes_t WHERE condition=?1", (w, ))
         for row in qGetBayes.fetchall():
             i = int(row[0])
             if (not i in words) or (i in prefix_words):
@@ -764,39 +762,27 @@ def get_suggestions(db, prefix_words, partial=""):
                 #bayes_factors[i] = float("infinity")
                 pass
             elif not i in bayes_factors:
-                bayes_factors[i] = float(row[1])
+                bayes_factors[i] = word_odds[i] * float(row[1])  # fix it up with the base 'odds of `i` occuring'
             else:
                 bayes_factors[i] *= float(row[1])
-    # now fix it up with the base 'odds of `i` occuring'
-    for i in bayes_factors.keys():
-        bayes_factors[i] *= word_odds[i]
-
-
-    # dump the top-N Bayesian relative to the log
-    result = [ (k, v) for k,v in bayes_factors.iteritems() ]
-    result.sort(key=lambda x: -x[1])
-    for i in xrange(0, min(10, len(result))):
-        log.debug("    Bayesian relative; id='{i}', word='{w}', factor='{f}'".format(i=result[i][0], w=words[result[i][0]].encode("utf-8"), f=result[i][1]))
 
     # find the longest prefix that matches the end of prefix_words
     prefix_id = -1
-    prefix_occurences = 0
     for j in xrange(len(prefix_words) - 1, -1, -1):
         w = prefix_words[j]
-        qGetPrefix.execute("SELECT id, occurences FROM prefix_t WHERE parent=?1 AND word=?2", (prefix_id, w))
+        qGetPrefix.execute("SELECT id FROM prefix_t WHERE parent=?1 AND word=?2", (prefix_id, w))
         result = qGetPrefix.fetchone()
         if not result:
-            log.debug("Prefix; id={i}, prefix='{p}', occurences='{n}'".format(i=prefix_id, p=" ".join(map(lambda x: words[x], prefix_words[j+1:])), n=prefix_occurences))
+            #log.debug("Prefix; id={i}, prefix='{p}'".format(i=prefix_id, p=" ".join(map(lambda x: words[x], prefix_words[j+1:]))))
             break
         prefix_id = int(result[0])
-        prefix_occurences = int(result[1])
-
+    #else:
+        #log.debug("Prefix; id={i}, prefix='{p}'".format(i=prefix_id, p=" ".join(map(lambda x: words[x], prefix_words))))
 
     # get the n-grams that start with that prefix
-    ngrams = {}
+    result = []
     qGetNgram.execute("SELECT follower, factor, occurences FROM ngram_t WHERE prefix=?1", (prefix_id, ))
-    result = qGetNgram.fetchall()
-    for row in result:
+    for row in qGetNgram.fetchall():
         i = int(row[0])
         if not i in words:
             log.error("Unknown ngram follower; i={i}".format(i=i))
@@ -805,33 +791,19 @@ def get_suggestions(db, prefix_words, partial=""):
             continue
         occurences = int(row[2])
         f = float(row[1]) if row[1] is not None else 1e100
-        #log.debug("N-gram candidate; id='{i}', word='{w}', ngram_factor='{f}', occurences='{n}'".format(i=i, w=words[i].encode("utf-8"), f=f, n=occurences))
-        ngrams[i] = { "factor": f, "occurences": occurences, "m": occurences*f/(1+f) }
 
-    # combine the Bayesian factors into the ngram-based ones
-    for i in ngrams.keys():
-        occurences = ngrams[i]["occurences"]
-        f = ngrams[i]["factor"]
-        bf = 1
+        # combine the Bayesian factors into the ngram-based ones
         if i in bayes_factors:
-            bf = bayes_factors[i]
-            f *= bf
+            f *= bayes_factors[i]
             del bayes_factors[i]
-        ngrams[i]["m"] = occurences * f / (1 + f)
 
-    # listify the ngram-based results, because we want them sorted by odds
-    #result = [ (i, ngrams[i]["m"]) for i in ngrams.keys() if not math.isinf(ngrams[i]["m"]) and not math.isnan(ngrams[i]["m"]) ]
-    result = [ (i, ngrams[i]["m"]) for i in ngrams.keys() if not math.isnan(ngrams[i]["m"]) ]
+        #log.debug("N-gram candidate; id='{i}', word='{w}', ngram_factor='{f}', occurences='{n}'".format(i=i, w=words[i].encode("utf-8"), f=f, n=occurences))
+        m = occurences * f / (1 + f)
+        if not math.isnan(m):
+            result.append((i, m))
+
+    # we need them ordered by descending expected value
     result.sort(key=lambda x: -x[1])
-
-    # log the top-10
-    for r in result[:10]:
-        i = r[0]
-        log.debug("N-gram result; id='{i}', word='{w}', ngram_factor='{f}', m='{m}'".format(
-            i=i,
-            w=words[i].encode("utf-8"),
-            f=ngrams[i]["factor"],
-            m=ngrams[i]["m"]))
 
     # if there are not enough suggestions, top up from the remaining Bayesian factors
     # NOTE: there is no 'occurences of condition' here, so sorting by odds factor instead
@@ -840,20 +812,21 @@ def get_suggestions(db, prefix_words, partial=""):
         if partial == "":
             bayes_factors = [ (i, f) for i, f in bayes_factors.iteritems() ]
         else:
-            bayes_factors = [ (i, f) for i, f in bayes_factors.iteritems() if word[i].startswith(partial) ]
+            bayes_factors = [ (i, f) for i, f in bayes_factors.iteritems() if words[i].startswith(partial) ]
         bayes_factors.sort(key=lambda x: -x[1])
         result.extend(bayes_factors[: N_sug - len(result)])
 
     # if still too few suggestions, top up from the global words
     # NOTE: there is no 'occurences of condition' here, so sorting by raw occurence counter
-    for w in words_sorted:
-        if len(result) >= N_sug:
-            break;
-        if not w[0].startswith(partial):
-            continue
-        result.append(w)
+    if len(result) < N_sug:
+        for w in words_sorted:
+            if len(result) >= N_sug:
+                break;
+            if not words[w[0]].startswith(partial):
+                continue
+            result.append(w)
 
-    return result[:N_sug]
+    return [ (words[x[0]], x[1]) for x in result[:N_sug] ]
 
 
 def test_input(db, f):
@@ -872,36 +845,71 @@ def test_input(db, f):
     num_words = len(word_odds)
     words = dict((w[0], w[1]) for w in word_odds)  # { id1: word1, id2: word2, ... }
     sdrow = dict((w[1].lower(), w[0]) for w in word_odds)  # { word1: id1, word2: id2, ... }
-    words_sorted = [ (w[1], w[2]) for w in word_odds ]
+    words_sorted = [ (w[0], w[2]) for w in word_odds ]
     words_sorted.sort(key=lambda x: -x[1])
     total_words = sum(w[2] for w in word_odds)
     word_odds = dict((w[0], float(w[2]) / (total_words - w[2])) for w in word_odds)
 
+    total_found = 0
+    total = 0
+    keystrokes = 0
     while True:
         line = f.readline()
         if not line:
             break
-
-        sentence = " ".join(split_to_sentences(line))
-        if not sentence:
+        sentence = " ".join(split_to_sentences(line.lower().rstrip("\r\n"))).split(" ")
+        if not sentence or not sentence[0]:
             continue
-        log.debug("Sentence; normalised='{s}'".format(s=sentence))
+        log.debug(u"Sentence; normalised='{s}'".format(s=sentence))
+        sentence_words = map(lambda w: sdrow[w] if w in sdrow else -1, sentence)
 
-        sentence_words = map(lambda w: sdrow[w], filter(lambda w: w in sdrow, sentence.lower().split(" ")))
+        for plen in xrange(0, len(sentence_words)):
+            shouldbe = sentence[plen]
+            log.debug(u"Next word; should_be='{s}'".format(s=shouldbe))
+            hint = ""
 
-        suggestions = get_suggestions(db, sentence_words, partial="")
-        i = 0
-        for s in suggestions:
-            log.debug("Suggestion; i='{i}', word='{w}', m='{m}'".format(i=i, w=words[s[0]], m=s[1]))
-            i += 1
+            total += 1
+            while hint != shouldbe:
+                suggestions = get_suggestions(db, filter(lambda w: w >= 0, sentence_words[:plen]), partial=hint)
+                log.debug(u"Result; suggestions='{s}'".format(s=list((x[0], round(x[1], 2)) for x in suggestions)))
+                
+                found = False
+                i = 0
+                for s in suggestions:
+                    #log.debug(u"Suggestion; i='{i}', word='{w}', m='{m}'".format(i=i, w=words[s[0]], m=s[1]))
+                    if s[0] == shouldbe:
+                        log.debug("Found at {i} after a hint of {n}".format(i=i, n=len(hint)))
+                        found = True
+                        break
+                    i += 1
+
+                if found:
+                    # got it, the user taps on the suggestion
+                    keystrokes += 1
+                    if hint == "":
+                        total_found += 1
+                    break
+
+                if hint == shouldbe:
+                    # completely missed it, the user typed in the word, and now taps to accept it
+                    log.debug("Missed");
+                    keystrokes += 1
+                    break;
+
+                # not found yet, the user taps on the next character
+                keystrokes += 1
+                hint += shouldbe[len(hint)]
+
+
+            log.info("Keystrokes = {k}, success ratio = {r} = {f} / {t}".format(k=keystrokes, r=float(total_found)/total, f=total_found, t=total))
 
     qGetBayes.close()
     qGetPrefix.close()
     qGetNgram.close()
 
-
        
 
+testfile = codecs.open("sample.test.txt", mode="r", encoding="utf-8")
 tests = StringIO("""
 The guy in front of me just bought a pound of bacon , a bouquet , and a case of
 You're the reason why I smile everyday. Can you follow me please? It would mean the
@@ -915,14 +923,11 @@ After the ice bucket challenge Louis will push his long wet hair out of his eyes
 Be grateful for the good times and keep the faith during the
 If this isn't the cutest thing you've ever seen, then you must be""")
 
-#tests = StringIO("""
-#Love that film and haven't seen it in quite some
-#After the ice bucket challenge Louis will push his long wet hair out of his eyes with his little
-#Be grateful for the good times and keep the faith during the
-#If this isn't the cutest thing you've ever seen, then you must be""")
+(db, already_exists) = open_dict_db("dict.db")
+db.execute("PRAGMA query_only = ON")
+test_input(db, tests)
+#test_input(db, testfile)
 
-#(db, already_exists) = open_dict_db("/mnt/dict.db")
-#db.execute("PRAGMA query_only = ON")
-#test_input(db, tests)
+testfile.close()
 
 # vim: set et ts=4 sw=4:
