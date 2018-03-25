@@ -27,7 +27,14 @@ shinyUI(
 			column(1, offset=2, checkboxInput("interactive", label = "Interactive", value = FALSE)),
 			column(1, offset=3, actionButton("generate", label = "Generate"))
 		),
-		conditionalPanel(condition="$('html').hasClass('shiny-busy')", style="text-align: center;", icon("spinner", "fa-3x fa-pulse")),
-		hr()
+		hr(),
+		fluidRow(
+			column(1, h4("Usage")),
+			column(6, offset=2, "In Interactive mode just type into the Input field or choose a suggestion", br(),
+			                    "In Non-Interactive mode edit the Input field and then press the Generate button")
+		),
+		hr(),
+		tags$footer("Week 7 Assignment for Coursera Data Science Specialisation - 2018 - Gabor Simon"),
+		conditionalPanel(condition="$('html').hasClass('shiny-busy')", style="text-align: center;", icon("spinner", "fa-3x fa-pulse"))
 	)
 )
