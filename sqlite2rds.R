@@ -1,9 +1,11 @@
 library(rlang)
 library(tibble)
-library(dplyr)
+#library(dplyr)
+library(stringr)
+library(tokenizers)
 library(DBI)
 #library(RSQLite)
-
+library(plyr)
 
 db <- dbConnect(RSQLite::SQLite(), "dict.db")
 dbExecute(db, "PRAGMA synchronous = OFF")
@@ -13,54 +15,30 @@ dbExecute(db, "PRAGMA mmap_size = 4294967296")
 dbExecute(db, "PRAGMA cache_size = 20000")
 dbExecute(db, "PRAGMA query_only = ON")
 
-x <- dbReadTable(db, "word_t", row.names=FALSE)
-saveRDS(x, "word_t.rds")
+words <- dbReadTable(db, "word_t", row.names=FALSE)
+word_id_remap <- new.env(hash=T) # lookup from orig id to sequential
+l_ply(1:nrow(words), function(x) { word_id_remap[[as.character(words$id[x])]] <- x })
+words$id <- 1:nrow(words) # might as well zap it
+saveRDS(words, "word_t.rds")
+rm(words)
 
-x <- dbReadTable(db, "bayes_t", row.names=FALSE)
-saveRDS(x, "bayes_t.rds")
+remap_word_ids <- function(l) { sapply(as.character(l), function(x) { word_id_remap[[x]] }) }
 
-x <- dbReadTable(db, "prefix_t", row.names=FALSE)
-saveRDS(x, "prefix_t.rds")
+bayes <- dbReadTable(db, "bayes_t", row.names=FALSE)
+bayes$condition <- remap_word_ids(bayes$condition)
+bayes$conditional <- remap_word_ids(bayes$conditional)
+saveRDS(bayes, "bayes_t.rds")
+rm(bayes)
 
-x <- dbReadTable(db, "ngram_t", row.names=FALSE)
-saveRDS(x, "ngram_t.rds")
+prefixes <- dbReadTable(db, "prefix_t", row.names=FALSE)
+prefixes$word <- remap_word_ids(prefixes$word)
+saveRDS(prefixes, "prefix_t.rds")
+rm(prefixes)
 
+ngrams <- dbReadTable(db, "ngram_t", row.names=FALSE)
+ngrams$follower <- remap_word_ids(ngrams$follower)
+saveRDS(ngrams, "ngram_t.rds")
+rm(ngrams)
 
 dbDisconnect(db)
-
-#dbGetQuery(mydb, 'SELECT * FROM mtcars LIMIT 5')
-#dbGetQuery(mydb, 'SELECT * FROM iris WHERE "Sepal.Length" < :x', params=list(x=4.6))
-#
-#rs <- dbSendQuery(mydb, 'SELECT * FROM mtcars')
-#while (!dbHasCompleted(rs)) {
-#	df <- dbFetch(rs, n = 10)
-#	message(nrow(df))
-#}
-#dbClearResult(rs)
-#
-#rs <- dbSendQuery(mydb, 'SELECT * FROM iris WHERE "Sepal.Length" < :x')
-#dbBind(rs, param = list(x = 4.5))
-#nrow(dbFetch(rs))
-#dbBind(rs, param = list(x = 4))
-#nrow(dbFetch(rs))
-#dbClearResult(rs)
-#
-#rs <- dbSendQuery(mydb, 'SELECT * FROM iris WHERE "Sepal.Length" = :x')
-#dbBind(rs, param = list(x = seq(4, 4.4, by = 0.1)))
-#nrow(dbFetch(rs))
-#dbClearResult(rs)
-#
-#dbExecute(mydb, 'DELETE FROM iris WHERE "Sepal.Length" < 4')
-#
-#rs <- dbSendStatement(mydb, 'DELETE FROM iris WHERE "Sepal.Length" < :x')
-#dbBind(rs, param = list(x = 4.5))
-#dbGetRowsAffected(rs)
-#dbClearResult(rs)
-#
-#dbDisconnect(mydb)
-#
-
-#valid_words <<- as.vector(rep(T, length(our_words$word)))
-#names(valid_words) <<- our_words$word
-# ... %>% Filter(f=function(x) !is.na(valid_words[x])) %>% ...
 
