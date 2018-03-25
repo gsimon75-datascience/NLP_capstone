@@ -130,7 +130,6 @@ sentence_rules = [
     [re.compile(" hes ", re.I),                             " he's "],
     [re.compile(" shes ", re.I),                            " she's "],
     [re.compile(" theyre ", re.I),                          " they're "],
-    [re.compile(" ill ", re.I),                             " I'll "],
     [re.compile(" youll ", re.I),                           " you'll "],
     [re.compile(" itll ", re.I),                            " it'll "],
     [re.compile(" theyll ", re.I),                          " they'll "],
