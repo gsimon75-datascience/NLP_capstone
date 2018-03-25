@@ -2,14 +2,14 @@ library(shiny)
 
 shinyUI(
 	fluidPage(
-		tags$head(tags$script(HTML('
-					Shiny.addCustomMessageHandler("jsCode",
-						function(message) {
-							console.log(message)
-							eval(message.code);
-						}
-						);
-					'))),
+		tags$head(
+			tags$script(HTML('Shiny.addCustomMessageHandler("jsCode",
+					function(message) {
+						console.log(message)
+						eval(message.code);
+					});')
+			)
+		),
 		titlePanel("Predictive Text Input"),
 		br(),
 		fluidRow(

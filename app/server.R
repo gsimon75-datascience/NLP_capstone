@@ -2,16 +2,21 @@ library(shiny)
 library(stringr)
 
 # Helper for enabling/disabling ActionButtons
-setActionButtonDisabled <- function(id, session, state) {
+setActionButtonDisabled <- function(session, id, state) {
 	session$sendCustomMessage(type="jsCode",
 		list(code=paste("$('#", id, "').prop('disabled',", if (state) "true" else "false", ")", sep="")))
+}
+
+setFocus <- function(session, id) {
+	session$sendCustomMessage(type="jsCode",
+		list(code=paste("document.getElementById(\"", id, "\").focus()", sep="")))
 }
 
 ## Global constants
 N_sug <- 4
 
 # 0=off, 1=critical, 2=error, 3=warning, 4=info, 5=debug, 6=verbose
-debug <- 4
+debug <- 5
 
 ## Read the list of known words
 words <- readRDS("word_t.rds")
@@ -44,6 +49,9 @@ bayes <- readRDS("bayes_t.rds")
 ## Read the N-gram prefixes table
 prefixes <- readRDS("prefix_t.rds")
 
+## Read the N-grams table
+ngrams <- readRDS("ngram_t.rds")
+
 shinyServer(
 	function(input, output, session) {
 		interactive <- reactive({
@@ -52,7 +60,7 @@ shinyServer(
 
 		# The 'Interactive' checkbox toggles the 'Generate' button between enabled and disabled
 		observeEvent(input$interactive, {
-			setActionButtonDisabled("generate", session, interactive())
+			setActionButtonDisabled(session, "generate", interactive())
 		})
 
 		# The 'Generate' button generates a prediction set and displays it on the 'Suggestion #N' buttons
@@ -99,6 +107,7 @@ shinyServer(
 			sentence <- trimws(sentence)
 			sentence <- if (sentence == "") word else paste(sentence, word)
 			updateTextInput(session, "userinput", value=paste(sentence, ""))
+			setFocus(session, "userinput")
 		}
 
 		# Display the predictions
@@ -112,10 +121,10 @@ shinyServer(
 		update_button <- function(btn, value) {
 			if (is.na(value)) {
 				updateActionButton(session, btn, label="?")
-				setActionButtonDisabled(btn, session, T)
+				setActionButtonDisabled(session, btn, T)
 			} else {
 				updateActionButton(session, btn, label=value)
-				setActionButtonDisabled(btn, session, F)
+				setActionButtonDisabled(session, btn, F)
 			}
 		}
 
@@ -134,11 +143,6 @@ shinyServer(
 			}
 
 			prefix_words <- strsplit(normalise_line(prefixline), "[[:space:]]+")[[1]]
-			# x <- lapply(prefix_words, function(w) {word_to_id[[w]]})
-			# # unrecognised words are NULLs, which would be dropped at unlist(), so convert them to NA
-			# x[sapply(x, is.null)] <- NA
-			# prefix_ids <- unlist(x, use.names=F)
-
 			prefix_ids <- sapply(unlist(lapply(prefix_words, function(w) {word_to_id[[w]]}), use.names=F), toString)
 			# NOTE: The NULLs that were produced by unrecognised words are implicitely dropped
 
@@ -257,22 +261,23 @@ shinyServer(
 
 		# Generate predictions for a given prefix and hint
 		generate_prediction <- function(prefix_ids, hint) {
-			# First, iterate though the prefixes and collect what other words does the Bayes table suggest ('conditional'), provided that this particular prefix is present ('condition') in the sentence
+			if (debug >= 4) print(paste0(Sys.time(), " generate_prediction([", paste(prefix_ids, collapse=", "), "], '", hint, "')"))
 
-			if (debug >= 4) print(paste("generate_prediction([", paste(prefix_ids, collapse=", "), "], '", hint, "')"))
-			
+			# First, iterate though the prefixes and collect what other words does the Bayes table suggest ('conditional'), provided that this particular prefix is present ('condition') in the sentence
+			if (debug >= 5) print(paste0(Sys.time(), " Searching Bayesian relative words;"))
 			bayes_factors <- list()
 			for (pfx in prefix_ids) {
-				relatives <- bayes[bayes$condition==pfx, c("conditional", "factor")]
-				if (debug >= 5) print(paste("  relatives for ", pfx, ", num=", nrow(relatives)))
+				relatives <- bayes[bayes$condition == pfx, c("conditional", "factor")]
+				if (debug >= 6) print(paste0(Sys.time(), " Found Bayesian relatives; word=", pfx, ", num=", nrow(relatives)))
 				for (idx in 1:nrow(relatives)) {
-					#if (!(idx in relatives$factor)) next
 					f <- relatives$factor[idx]
-					if (is.na(f)) next
+					if (is.na(f))
+						next
 					i <- toString(relatives$conditional[idx])
 					# Skip unsuitable items
-					if (debug >= 6) print(paste("  relative ", idx, "; id=", i, ", factor=", f))
-					if (!startsWith(id_to_word[[i]], hint)) next
+					if (debug >= 6) print(paste0(Sys.time(), "   relative ", idx, "; id=", i, ", factor=", f))
+					if (!startsWith(id_to_word[[i]], hint))
+						next
 					# Chain this factor to the already collected ones
 					if (is.null(bayes_factors[[i]])) {
 						# We start with the unconditional odds of that suggested word 'i'
@@ -285,17 +290,59 @@ shinyServer(
 			}
 
 			# Then find the longest known prefix that matches the end of what we got
+			if (debug >= 5) print(paste0(Sys.time(), " Searching for longest known N-gram prefix;"))
 			prefix_id <- -1
-			# FIXME: implement
+			for (i in length(prefix_ids):1) {
+				next_id <- prefixes[(prefixes$parent == prefix_id) & (prefixes$word == prefix_ids[i]), "id"]
+				if (length(next_id) == 0)
+					break
+				prefix_id = next_id
+			}
+			if (debug >= 5) print(paste0(Sys.time(), " Found prefix; id=", prefix_id))
 
 			result <- vector()
+			more_needed <- N_sug
+
+			# Find the N-grams that start with the found prefix
+			if (debug >= 5) print(paste0(Sys.time(), " Searching for N-gram followers;"))
+			ngram_m <- list()
+			followers <- ngrams[ngrams$prefix == prefix_id, c("follower", "occurences", "factor")]
+			num_followers <- nrow(followers)
+
+			if (num_followers > 0) {
+				if (debug >= 5) print(paste0(Sys.time(), " Found N-grams followers; n=", num_followers))
+				for (idx in 1:num_followers) {
+					i <- toString(followers$follower[idx])
+					f <- followers$factor[idx]
+					if (is.na(f))
+						f <- 1e100
+					# Skip unsuitable items
+					if (debug >= 6) print(paste0(Sys.time(), "  follower ", idx, "; id=", i, ", factor=", f))
+					if (!startsWith(id_to_word[[i]], hint))
+						next
+					# Combine the Bayesian factors into the ngram-based ones
+					if (i %in% bayes_factors) {
+						f <- f * bayes_factors[[i]]
+						bayes_factors[[i]] <- NULL # remove to prevent double suggestions later
+					}
+
+					# Calculate an expected value (remember: f is an odds)
+					ngram_m[i] <- followers$occurences[idx] * f / (1 + f)
+				}
+
+				# Sort the N-gram hints and 
+				ngram_hints <- sort(unlist(ngram_m), decreasing=T)
+				ngram_hints <- sapply(attr(ngram_hints, 'name'), function(x) { id_to_word[[x]] })
+				names(ngram_hints) <- NULL
+				result <- append(result, ngram_hints[1:min(more_needed, length(ngram_hints))])
+				more_needed <- N_sug - length(result)
+			}
 
 			# If there are too few results, top it up from the Bayesian relatives' list
-			more_needed <- N_sug - length(result)
 			if ((more_needed > 0) && (length(bayes_factors) > 0)) {
-				if (debug >= 5) print(paste0("Topping up with Bayesian relatives; needed=", more_needed))
-				bayes_hints_values <- sort(unlist(bayes_factors), decreasing=T)
-				bayes_hints <- sapply(attr(bayes_hints_values, 'name'), function(x) { id_to_word[[x]] })
+				if (debug >= 5) print(paste0(Sys.time(), " Topping up with Bayesian relatives; needed=", more_needed))
+				bayes_hints <- sort(unlist(bayes_factors), decreasing=T)
+				bayes_hints <- sapply(attr(bayes_hints, 'name'), function(x) { id_to_word[[x]] })
 				names(bayes_hints) <- NULL
 				result <- append(result, bayes_hints[1:min(more_needed, length(bayes_hints))])
 				more_needed <- N_sug - length(result)
@@ -303,7 +350,7 @@ shinyServer(
 
 			# If there are still too few results, top it up from the (unconditional) global word list
 			if (more_needed > 0) {
-				if (debug >= 5) print(paste0("Topping up with dictionary words; needed=", more_needed))
+				if (debug >= 5) print(paste0(Sys.time(), " Topping up with dictionary words; needed=", more_needed))
 				for (global_hint in words_sorted) {
 					if (!startsWith(global_hint, hint)) next
 					if (global_hint %in% result) next
@@ -313,7 +360,7 @@ shinyServer(
 				more_needed <- N_sug - length(result)
 			}
 
-			if (debug >= 4) print(paste("Result: [", paste(result, collapse=", "), "]"))
+			if (debug >= 4) print(paste0(Sys.time(), " Result: [", paste0(result, collapse=", "), "]"))
 			result
 		}
 
