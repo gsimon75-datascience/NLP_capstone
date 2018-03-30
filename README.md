@@ -14,6 +14,7 @@ been removed.
 Start with `build_model.py`, proceed with `find_ngrams.cc` and finish with `cleanup.sql`, these are
 the main 3 files, the rest is mostly scratchpads, API tests, and so on.
 
+The original corpus is downloaded from [here](https://d396qusza40orc.cloudfront.net/dsscapstone/dataset/Coursera-SwiftKey.zip).
 
 ## Concepts
 
