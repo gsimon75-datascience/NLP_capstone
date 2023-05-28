@@ -1,0 +1,68 @@
+# NLP_capstone15:25:47  INFO Using dict db; db_filename='/mnt/dict.db'
+15:25:47  INFO Collecting ngrams; infile='final/en_US/all.normalised.sentences'
+15:25:48 DEBUG   N-gram gen; lines='559', prefixes='16585',        mem='(13649416192L, 10406871040L, 24469504L, 9109504L, 0L, 0L)'
+15:25:49 DEBUG   N-gram gen; lines='1175', prefixes='31635',       mem='(13649416192L, 10397110272L, 24469504L, 9109504L, 0L, 0L)'
+15:25:50 DEBUG   N-gram gen; lines='1956', prefixes='48652',       mem='(13649416192L, 10384412672L, 24477696L, 9109504L, 0L, 0L)'
+15:25:51 DEBUG   N-gram gen; lines='2724', prefixes='64704',       mem='(13649416192L, 10374328320L, 24477696L, 9109504L, 0L, 0L)'
+15:25:52 DEBUG   N-gram gen; lines='3477', prefixes='79796',       mem='(13649416192L, 10363564032L, 24485888L, 9109504L, 0L, 0L)'
+15:25:53 DEBUG   N-gram gen; lines='4308', prefixes='95802',       mem='(13649416192L, 10353041408L, 24485888L, 9109504L, 0L, 0L)'
+...
+15:57:39 DEBUG   N-gram gen; lines='2002243', prefixes='17405472', mem='(13649416192L,   152989696L,  5517312L, 9109504L, 0L, 0L)'
+15:57:40 DEBUG   N-gram gen; lines='2003431', prefixes='17413555', mem='(13649416192L,   147197952L,  5525504L, 9109504L, 0L, 0L)'
+
+
+
+
+
+15:57:41 DEBUG   N-gram gen; lines='2004604', prefixes='17421499', mem='(13649416192L,   166920192L,  5443584L, 9109504L, 0L, 0L)'
+15:57:41 DEBUG Near OOM;
+
+15:57:41 DEBUG psutil.virtual_memory() = (total=13649416192L, available=1074778112L, percent=92.1, used=13484011520L, free=165404672L, active=12705259520, inactive=493293568, buffers=5443584L, cached=903929856)
+15:57:41 DEBUG pslin.linux_sysinfo() =   (total=13649416192L,                                                         free=165404672L,                                         buffers=5443584L, shared=9109504L, totalswap=0L, freeswap=0L)
+
+15:57:41 DEBUG Committing cache;
+
+15:57:41 DEBUG psutil.virtual_memory() = (total=13649416192L, available=1074778112L, percent=92.1, used=13484011520L, free=165404672L, active=12705259520, inactive=493293568, buffers=5443584L, cached=903929856)
+15:57:41 DEBUG pslin.linux_sysinfo()   = (total=13649416192L,                                                         free=165404672L,                                         buffers=5443584L, shared=9109504L, 0L, 0L)
+
+15:57:42 DEBUG   Committed; keys='50260', cache_size='38727051'
+15:57:43 DEBUG   Committed; keys='74324', cache_size='38702987'
+...
+17:02:36 DEBUG   Committed; keys='38759505', cache_size='17806'
+17:02:37 DEBUG   Committed; keys='38764680', cache_size='12631'
+17:02:38 DEBUG   Committed; keys='38771403', cache_size='5908'
+17:02:40 DEBUG   Committed; keys='38777310', cache_size='0'
+
+17:02:41 DEBUG psutil.virtual_memory() = (total=13649416192L, available=1568272384L, percent=88.5, used=13058072576L, free=591343616L, active=12201451520, inactive=647897088, buffers=6356992L, cached=970571776)
+17:02:41 DEBUG pslin.linux_sysinfo()   = (total=13649416192L,                                                         free=590708736L,                                         buffers=6356992L, shared=9109504L, 0L, 0L)
+
+17:02:57 DEBUG   Flushed cache;
+
+17:02:57 DEBUG psutil.virtual_memory() = (total=13649416192L, available=1568157696L, percent=88.5, used=13060161536L, free=589254656L, active=12201676800, inactive=649617408, buffers=6385664L, cached=972517376)
+17:02:57 DEBUG pslin.linux_sysinfo()   = (total=13649416192L,                                                         free=589254656L,                                         buffers=6385664L, shared=9109504L, 0L, 0L)
+
+17:03:11 DEBUG   N-gram gen; lines='2004899', prefixes='17423457', mem='(13649416192L, 589033472L, 6402048L, 9109504L, 0L, 0L)'
+
+
+
+REPEAT:
+
+15:57:41 DEBUG Committing cache;
+15:57:41 DEBUG psutil.virtual_memory() = (total=13649416192L, available=1074778112L, percent=92.1, used=13484011520L, free=165404672L, active=12705259520, inactive=493293568, buffers=5443584L, cached=903929856)
+15:57:41 DEBUG pslin.linux_sysinfo()   = (total=13649416192L,                                                         free=165404672L,                                         buffers=5443584L, shared=9109504L, 0L, 0L)
+17:02:57 DEBUG   Flushed cache;
+17:02:57 DEBUG psutil.virtual_memory() = (total=13649416192L, available=1568157696L, percent=88.5, used=13060161536L, free=589254656L, active=12201676800, inactive=649617408, buffers=6385664L, cached=972517376)
+17:02:57 DEBUG pslin.linux_sysinfo()   = (total=13649416192L,                                                         free=589254656L,                                         buffers=6385664L, shared=9109504L, 0L, 0L)
+
+delta:                                    
+total     = +0
+available = +493379584
+
+used      = -423849984
+free      = +423849984
+
+active    = -503582720
+inactive  = +156323840
+buffers   =    +942080
+cached    =  +68587520
+shared    = +0
